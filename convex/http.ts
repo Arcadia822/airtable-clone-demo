@@ -434,7 +434,10 @@ async function ownershipHandler(
           sessionId: stringValue(input, "sessionId"),
         },
       );
-      return success(data);
+      if (!data.allowed) {
+        throw new ConvexError({ code: "EVE_SESSION_FORBIDDEN" });
+      }
+      return success({ allowed: true });
     }
     if (action === "assert-continuation") {
       const continuationTokenHash = stringValue(
@@ -453,7 +456,10 @@ async function ownershipHandler(
           continuationTokenHash,
         },
       );
-      return success(data);
+      if (!data.allowed) {
+        throw new ConvexError({ code: "EVE_SESSION_FORBIDDEN" });
+      }
+      return success({ allowed: true });
     }
     throw new ConvexError({ code: "INVALID_REQUEST" });
   } catch (error) {

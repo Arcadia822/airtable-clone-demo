@@ -151,6 +151,8 @@ export function presentAssistantError(
         : ""
   const normalized = message.toLocaleLowerCase()
   if (
+    normalized.includes("eve_session_forbidden") ||
+    normalized.includes("assistant_session_forbidden") ||
     normalized.includes("ownership") ||
     normalized.includes("continuation token") ||
     normalized.includes("stale continuation") ||

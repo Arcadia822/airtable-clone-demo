@@ -186,3 +186,56 @@ describe("AI monthly usage", () => {
     ).toHaveLength(1);
   });
 });
+
+describe("AI session ownership checks", () => {
+  it("returns a quiet denial while a new session is still registering", async () => {
+    const test = setup();
+
+    await expect(
+      test.query(internal.aiSessions.assertOwnership, {
+        organizationId: "org_session",
+        sessionId: "session_pending",
+        userId: "user_session",
+      }),
+    ).resolves.toEqual({ allowed: false });
+    await expect(
+      test.query(internal.aiSessions.assertContinuationOwnership, {
+        continuationTokenHash: "c".repeat(64),
+        organizationId: "org_session",
+        userId: "user_session",
+      }),
+    ).resolves.toEqual({ allowed: false });
+  });
+
+  it("allows only the registered user and organization", async () => {
+    const test = setup();
+    await test.mutation(internal.aiSessions.registerOwnership, {
+      continuationTokenHash: "d".repeat(64),
+      organizationId: "org_session",
+      sessionId: "session_registered",
+      userId: "user_session",
+    });
+
+    await expect(
+      test.query(internal.aiSessions.assertOwnership, {
+        organizationId: "org_session",
+        sessionId: "session_registered",
+        userId: "user_session",
+      }),
+    ).resolves.toEqual({ allowed: true });
+    await expect(
+      test.query(internal.aiSessions.assertOwnership, {
+        organizationId: "org_other",
+        sessionId: "session_registered",
+        userId: "user_session",
+      }),
+    ).resolves.toEqual({ allowed: false });
+    await expect(
+      test.query(internal.aiSessions.assertContinuationOwnership, {
+        continuationTokenHash: "d".repeat(64),
+        organizationId: "org_session",
+        userId: "user_session",
+      }),
+    ).resolves.toEqual({ allowed: true });
+  });
+});

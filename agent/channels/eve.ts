@@ -13,6 +13,7 @@ import {
   extractEveSessionId,
   isEveResetRequest,
 } from "../../src/lib/eve/session-ownership";
+import { EveBridgeRequestError } from "../../src/lib/eve/signed-fetch";
 
 let clerkClient: ClerkClient | undefined;
 
@@ -63,7 +64,13 @@ const clerkOrganizationAuth: AuthFn<Request> = async (request) => {
         organizationId: auth.orgId,
         userId: auth.userId,
       });
-    } catch {
+    } catch (error) {
+      if (
+        !(error instanceof EveBridgeRequestError) ||
+        error.status !== 403
+      ) {
+        throw error;
+      }
       throw new ForbiddenError({
         code: "assistant_session_forbidden",
         message: "This assistant session does not belong to the active user and organization.",
@@ -78,7 +85,13 @@ const clerkOrganizationAuth: AuthFn<Request> = async (request) => {
           organizationId: auth.orgId,
           userId: auth.userId,
         });
-      } catch {
+      } catch (error) {
+        if (
+          !(error instanceof EveBridgeRequestError) ||
+          error.status !== 403
+        ) {
+          throw error;
+        }
         throw new ForbiddenError({
           code: "assistant_session_forbidden",
           message:

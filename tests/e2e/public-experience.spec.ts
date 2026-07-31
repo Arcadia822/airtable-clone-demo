@@ -12,10 +12,10 @@ async function gotoHydrated(page: Page, path: string) {
 test("marketing page leads to the interactive workspace", async ({ page }) => {
   await gotoHydrated(page, "/")
   await expect(
-    page.getByRole("heading", { name: /Turn scattered work into shared momentum/i }),
+    page.getByRole("heading", { name: "Data that moves with your team." }),
   ).toBeVisible()
   await page
-    .getByRole("button", { name: /Open interactive workspace/i })
+    .getByRole("button", { name: "Explore the live demo" })
     .click()
   await expect(page).toHaveURL(/\/demo$/)
   await expect(page.getByRole("grid", { name: "Records grid" })).toBeVisible()

@@ -148,8 +148,8 @@ async function requireScopedTable(
   organizationId: string,
   input: JsonObject,
 ) {
-  const baseId = stringValue(input, "baseId") as Id<"bases">;
-  const tableId = stringValue(input, "tableId") as Id<"tables">;
+  const baseId = stringValue(input, "baseId");
+  const tableId = stringValue(input, "tableId");
   const base = await requireBase(ctx, organizationId, baseId);
   const table = await requireTable(ctx, organizationId, tableId);
   if (table.baseId !== base._id) {
@@ -167,7 +167,11 @@ async function optionalScopedView(
 ) {
   const viewId = optionalString(input, "viewId", 256);
   if (!viewId) return undefined;
-  const view = await ctx.db.get(viewId as Id<"views">);
+  const normalizedViewId = ctx.db.normalizeId("views", viewId);
+  if (!normalizedViewId) {
+    throw new ConvexError({ code: "VIEW_NOT_FOUND" });
+  }
+  const view = await ctx.db.get(normalizedViewId);
   if (
     !view ||
     view.orgId !== organizationId ||
@@ -397,7 +401,11 @@ async function summarizeTable(
     ...fieldIds,
     ...(groupByFieldId ? [groupByFieldId] : []),
   ])) {
-    const field = await ctx.db.get(fieldId as Id<"fields">);
+    const normalizedFieldId = ctx.db.normalizeId("fields", fieldId);
+    if (!normalizedFieldId) {
+      throw new ConvexError({ code: "FIELD_NOT_FOUND" });
+    }
+    const field = await ctx.db.get(normalizedFieldId);
     if (
       !field ||
       field.orgId !== organizationId ||
@@ -542,11 +550,11 @@ async function inspectForm(
   organizationId: string,
   input: JsonObject,
 ) {
-  const baseId = stringValue(input, "baseId") as Id<"bases">;
-  const formId = stringValue(input, "formId") as Id<"forms">;
+  const baseId = stringValue(input, "baseId");
+  const formId = stringValue(input, "formId");
   const base = await requireBase(ctx, organizationId, baseId);
   const form = await requireForm(ctx, organizationId, formId);
-  if (form.baseId !== baseId) {
+  if (form.baseId !== base._id) {
     throw new ConvexError({ code: "FORM_NOT_IN_BASE" });
   }
   const table = await requireTable(ctx, organizationId, form.tableId);
@@ -618,12 +626,12 @@ async function formAnalytics(
   organizationId: string,
   input: JsonObject,
 ) {
-  const baseId = stringValue(input, "baseId") as Id<"bases">;
-  const formId = stringValue(input, "formId") as Id<"forms">;
+  const baseId = stringValue(input, "baseId");
+  const formId = stringValue(input, "formId");
   const days = integerValue(input, "days", 30, 1, 90);
   const base = await requireBase(ctx, organizationId, baseId);
   const form = await requireForm(ctx, organizationId, formId);
-  if (form.baseId !== baseId) {
+  if (form.baseId !== base._id) {
     throw new ConvexError({ code: "FORM_NOT_IN_BASE" });
   }
   const table = await requireTable(ctx, organizationId, form.tableId);

@@ -244,6 +244,21 @@ describe("AI read and write trust boundaries", () => {
         },
       }),
     ).rejects.toThrow(/BASE_NOT_FOUND/);
+
+    await expect(
+      test.query(internal.aiReads.read, {
+        organizationId: "org_ai_read",
+        userId: "user_ai_read",
+        sessionId: "session-ai-read",
+        operation: "describe_table",
+        input: {
+          baseId:
+            "Active base: Product operations; secure reference: not-an-id",
+          tableId:
+            "Active table: Product roadmap; secure reference: not-an-id",
+        },
+      }),
+    ).rejects.toThrow(/BASE_NOT_FOUND/);
   });
 
   it("rejects stale record update, record delete, and form-setting proposals", async () => {

@@ -1,4 +1,4 @@
-import type { Doc, Id } from "../_generated/dataModel";
+import type { Doc } from "../_generated/dataModel";
 import type { MutationCtx, QueryCtx } from "../_generated/server";
 import { ConvexError } from "convex/values";
 import { generateKeyBetween } from "jittered-fractional-indexing";
@@ -25,10 +25,14 @@ export async function hasActiveFormParents(
 export async function requireBase(
   ctx: ReadCtx,
   orgId: string,
-  baseId: Id<"bases">,
+  baseId: string,
   allowDeleted = false,
 ) {
-  const base = await ctx.db.get(baseId);
+  const normalizedBaseId = ctx.db.normalizeId("bases", baseId);
+  if (!normalizedBaseId) {
+    throw new ConvexError({ code: "BASE_NOT_FOUND" });
+  }
+  const base = await ctx.db.get(normalizedBaseId);
   if (
     !base ||
     base.orgId !== orgId ||
@@ -42,10 +46,14 @@ export async function requireBase(
 export async function requireTable(
   ctx: ReadCtx,
   orgId: string,
-  tableId: Id<"tables">,
+  tableId: string,
   allowDeleted = false,
 ) {
-  const table = await ctx.db.get(tableId);
+  const normalizedTableId = ctx.db.normalizeId("tables", tableId);
+  if (!normalizedTableId) {
+    throw new ConvexError({ code: "TABLE_NOT_FOUND" });
+  }
+  const table = await ctx.db.get(normalizedTableId);
   if (
     !table ||
     table.orgId !== orgId ||
@@ -62,10 +70,14 @@ export async function requireTable(
 export async function requireField(
   ctx: ReadCtx,
   orgId: string,
-  fieldId: Id<"fields">,
+  fieldId: string,
   allowDeleted = false,
 ) {
-  const field = await ctx.db.get(fieldId);
+  const normalizedFieldId = ctx.db.normalizeId("fields", fieldId);
+  if (!normalizedFieldId) {
+    throw new ConvexError({ code: "FIELD_NOT_FOUND" });
+  }
+  const field = await ctx.db.get(normalizedFieldId);
   if (
     !field ||
     field.orgId !== orgId ||
@@ -82,10 +94,14 @@ export async function requireField(
 export async function requireRecord(
   ctx: ReadCtx,
   orgId: string,
-  recordId: Id<"records">,
+  recordId: string,
   allowDeleted = false,
 ) {
-  const record = await ctx.db.get(recordId);
+  const normalizedRecordId = ctx.db.normalizeId("records", recordId);
+  if (!normalizedRecordId) {
+    throw new ConvexError({ code: "RECORD_NOT_FOUND" });
+  }
+  const record = await ctx.db.get(normalizedRecordId);
   if (
     !record ||
     record.orgId !== orgId ||
@@ -102,10 +118,14 @@ export async function requireRecord(
 export async function requireForm(
   ctx: ReadCtx,
   orgId: string,
-  formId: Id<"forms">,
+  formId: string,
   allowDeleted = false,
 ) {
-  const form = await ctx.db.get(formId);
+  const normalizedFormId = ctx.db.normalizeId("forms", formId);
+  if (!normalizedFormId) {
+    throw new ConvexError({ code: "FORM_NOT_FOUND" });
+  }
+  const form = await ctx.db.get(normalizedFormId);
   if (
     !form ||
     form.orgId !== orgId ||

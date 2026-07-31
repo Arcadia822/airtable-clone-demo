@@ -174,8 +174,8 @@ async function requireScopedTable(
   organizationId: string,
   input: JsonObject,
 ) {
-  const baseId = stringValue(input, "baseId") as Id<"bases">;
-  const tableId = stringValue(input, "tableId") as Id<"tables">;
+  const baseId = stringValue(input, "baseId");
+  const tableId = stringValue(input, "tableId");
   const base = await requireBase(ctx, organizationId, baseId);
   const table = await requireTable(ctx, organizationId, tableId);
   if (table.baseId !== base._id) {

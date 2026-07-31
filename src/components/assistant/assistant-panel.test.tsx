@@ -15,10 +15,17 @@ import {
 import { AssistantPanel } from "./assistant-panel"
 
 const clerkGetToken = vi.hoisted(() => vi.fn())
+const clerkAuthState = vi.hoisted(() => ({
+  getToken: clerkGetToken,
+  isLoaded: true,
+  orgId: "org_primary",
+  sessionId: "session_primary",
+}))
 const clientSession = vi.hoisted(() => ({
   cancel: vi.fn(),
   reset: vi.fn(),
 }))
+const useEveAgentMock = vi.hoisted(() => vi.fn())
 const saveReportMutation = vi.hoisted(() => vi.fn())
 const archiveReportMutation = vi.hoisted(() => vi.fn())
 const savedReportsState = vi.hoisted(() => ({
@@ -41,7 +48,7 @@ const agentState = vi.hoisted(() => ({
 }))
 
 vi.mock("@clerk/nextjs", () => ({
-  useAuth: () => ({ getToken: clerkGetToken }),
+  useAuth: () => clerkAuthState,
 }))
 
 vi.mock("convex/react", async () => {
@@ -90,7 +97,7 @@ vi.mock("eve/client", () => ({
 }))
 
 vi.mock("eve/react", () => ({
-  useEveAgent: () => agentState,
+  useEveAgent: (input: unknown) => useEveAgentMock(input),
 }))
 
 function approvalMessage() {
@@ -218,6 +225,9 @@ describe("AssistantPanel trust and recovery", () => {
     agentState.events = []
     agentState.status = "ready"
     agentState.send.mockResolvedValue(undefined)
+    useEveAgentMock.mockReturnValue(agentState)
+    clerkAuthState.orgId = "org_primary"
+    clerkAuthState.sessionId = "session_primary"
     saveReportMutation.mockResolvedValue(null)
     archiveReportMutation.mockResolvedValue(null)
     savedReportsState.lists = { active: [], archived: [] }
@@ -593,7 +603,18 @@ The roadmap has a balanced mix of upcoming and completed work.`,
     await waitFor(() => {
       expect(clientSession.reset).toHaveBeenCalledTimes(1)
       expect(agentState.reset).toHaveBeenCalledTimes(1)
+      expect(useEveAgentMock).toHaveBeenCalledTimes(2)
     })
+  })
+
+  it("starts a fresh client conversation when the active Clerk organization changes", () => {
+    const { rerender } = render(<AssistantPanel />)
+
+    expect(useEveAgentMock).toHaveBeenCalledTimes(1)
+    clerkAuthState.orgId = "org_secondary"
+    rerender(<AssistantPanel />)
+
+    expect(useEveAgentMock).toHaveBeenCalledTimes(2)
   })
 
   it("requests server cancellation for the active turn instead of stopping only the browser stream", async () => {

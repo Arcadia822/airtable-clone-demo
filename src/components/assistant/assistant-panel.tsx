@@ -93,6 +93,10 @@ import {
 } from "@/lib/eve/assistant-resilience";
 import { resolveEveHost } from "@/lib/eve/host";
 import {
+  buildAssistantClientContext,
+  type AssistantPageContext,
+} from "@/lib/eve/page-context";
+import {
   type AssistantToolDetail,
   type AssistantErrorPresentation,
   presentAssistantTool,
@@ -104,12 +108,7 @@ import { cn } from "@/lib/utils";
 import { api } from "../../../convex/_generated/api";
 import type { Id } from "../../../convex/_generated/dataModel";
 
-export type AssistantPageContext = {
-  base?: { id: string; name?: string };
-  table?: { id: string; name?: string };
-  form?: { id: string; name?: string };
-  view?: { id: string; name?: string };
-};
+export type { AssistantPageContext } from "@/lib/eve/page-context";
 
 export type AssistantPanelProps = {
   className?: string;
@@ -126,6 +125,7 @@ type InputResponse = {
 
 type CancellationReason = "manual" | "timeout";
 type AnalysisSaveTarget = "report" | "chart";
+type ConversationResetResult = "failed" | "ready" | "remounted";
 
 type CompletedAssistantAnalysis = {
   chart?: AssistantChart;
@@ -164,12 +164,60 @@ const suggestions = [
   "Find the most common values",
 ];
 
-export function AssistantPanel({
+type AssistantPanelSessionProps = AssistantPanelProps & {
+  initialDraft: string;
+  onHardReset: (draft: string) => void;
+};
+
+type AssistantResetState = {
+  draft: string;
+  epoch: number;
+  identityKey: string;
+};
+
+export function AssistantPanel(props: AssistantPanelProps) {
+  const { isLoaded, orgId, sessionId } = useAuth();
+  const identityKey = `${isLoaded ? (sessionId ?? "signed-out") : "loading"}:${
+    orgId ?? "no-organization"
+  }`;
+  const [resetState, setResetState] = useState<AssistantResetState>(() => ({
+    draft: "",
+    epoch: 0,
+    identityKey,
+  }));
+  const resetMatchesIdentity = resetState.identityKey === identityKey;
+  const epoch = resetMatchesIdentity ? resetState.epoch : 0;
+  const initialDraft = resetMatchesIdentity ? resetState.draft : "";
+  const hardReset = useCallback(
+    (draft: string) => {
+      setResetState((current) => ({
+        draft,
+        epoch:
+          current.identityKey === identityKey ? current.epoch + 1 : 1,
+        identityKey,
+      }));
+    },
+    [identityKey],
+  );
+
+  return (
+    <AssistantPanelSession
+      {...props}
+      initialDraft={initialDraft}
+      key={`${identityKey}:${epoch}`}
+      onHardReset={hardReset}
+    />
+  );
+}
+
+function AssistantPanelSession({
   className,
   context,
   host,
+  initialDraft,
+  onHardReset,
   title = "Workspace analyst",
-}: AssistantPanelProps) {
+}: AssistantPanelSessionProps) {
   const clerkAuth = useAuth();
   const convexAuth = useConvexAuth();
   const usage = useQuery(
@@ -204,23 +252,20 @@ export function AssistantPanel({
     explicitHost: host,
     nodeEnv: process.env.NODE_ENV,
   });
-  const [sessionEpoch, setSessionEpoch] = useState(0);
   const clientSession = useMemo(
-    () => {
-      void sessionEpoch;
-      return new Client({
+    () =>
+      new Client({
         host: resolvedHost ?? "",
         auth: { bearer: resolveBearer },
         preserveCompletedSessions: true,
         redirect: "error",
-      }).session();
-    },
-    [resolveBearer, resolvedHost, sessionEpoch],
+      }).session(),
+    [resolveBearer, resolvedHost],
   );
   const agent = useEveAgent({
     session: clientSession,
   });
-  const [draft, setDraft] = useState("");
+  const [draft, setDraft] = useState(initialDraft);
   const [localFailure, setLocalFailure] =
     useState<AssistantErrorPresentation>();
   const [lastRequest, setLastRequest] = useState<string>();
@@ -242,7 +287,10 @@ export function AssistantPanel({
   const isBusy = agent.status === "submitted" || agent.status === "streaming";
   const messages = agent.data.messages;
 
-  const pageContext = useMemo(() => buildPageContext(context), [context]);
+  const pageContext = useMemo(
+    () => buildAssistantClientContext(context),
+    [context],
+  );
   const scopeLabel = useMemo(() => describePageScope(context), [context]);
   const latestAnalysis = useMemo(
     () => latestCompletedAssistantAnalysis(messages, isBusy),
@@ -397,7 +445,7 @@ export function AssistantPanel({
     try {
       await agent.send({
         message: normalized,
-        ...(pageContext.length > 0 ? { clientContext: pageContext } : {}),
+        ...(pageContext ? { clientContext: pageContext } : {}),
       });
     } catch (error) {
       setDraft(normalized);
@@ -437,8 +485,10 @@ export function AssistantPanel({
     }
   }
 
-  async function startNewConversation(keepLastRequest = false): Promise<boolean> {
-    const requestToKeep = keepLastRequest ? lastRequest : undefined;
+  async function startNewConversation(
+    keepLastRequest = false,
+  ): Promise<ConversationResetResult> {
+    const requestToKeep = keepLastRequest ? (lastRequest ?? draft) : undefined;
     setLocalFailure(undefined);
     setCancellationReason(undefined);
     cancellationRequestedRef.current = false;
@@ -451,26 +501,24 @@ export function AssistantPanel({
       agent.reset();
       setDraft(requestToKeep ?? "");
       if (!keepLastRequest) setLastRequest(undefined);
-      return true;
+      return "ready";
     } catch (error) {
       const failure = presentAssistantError(error);
       if (failure.action === "new-session") {
         agent.reset();
-        setSessionEpoch((current) => current + 1);
-        setDraft(requestToKeep ?? "");
-        if (!keepLastRequest) setLastRequest(undefined);
-        return true;
+        onHardReset(requestToKeep ?? "");
+        return "remounted";
       }
       setLocalFailure(failure);
-      return false;
+      return "failed";
     }
   }
 
   async function retryLastRequest(): Promise<void> {
     if (!lastRequest || isBusy) return;
     const request = lastRequest;
-    const reset = await startNewConversation(false);
-    if (!reset) return;
+    const reset = await startNewConversation(true);
+    if (reset !== "ready") return;
     await submitMessage(request);
   }
 
@@ -1860,28 +1908,6 @@ function formatReportDate(timestamp: number): string {
   return new Date(timestamp).toLocaleDateString(undefined, {
     dateStyle: "medium",
   });
-}
-
-function buildPageContext(context?: AssistantPageContext): string[] {
-  if (!context) {
-    return [];
-  }
-
-  const result = [
-    context.base
-      ? `Active base: ${context.base.name ?? "Untitled"}; secure reference: ${context.base.id}`
-      : undefined,
-    context.table
-      ? `Active table: ${context.table.name ?? "Untitled"}; secure reference: ${context.table.id}`
-      : undefined,
-    context.form
-      ? `Active form: ${context.form.name ?? "Untitled"}; secure reference: ${context.form.id}`
-      : undefined,
-    context.view
-      ? `Active view: ${context.view.name ?? "Untitled"}; secure reference: ${context.view.id}`
-      : undefined,
-  ];
-  return result.filter((value): value is string => Boolean(value));
 }
 
 function describePageScope(context?: AssistantPageContext): string {

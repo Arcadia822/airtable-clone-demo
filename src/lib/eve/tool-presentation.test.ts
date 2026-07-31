@@ -171,6 +171,14 @@ describe("assistant display safety", () => {
     expect(presentAssistantError("ownership mismatch")).toMatchObject({
       action: "new-session",
     })
+    expect(presentAssistantError("EVE_SESSION_FORBIDDEN")).toMatchObject({
+      action: "new-session",
+    })
+    expect(
+      presentAssistantError("assistant_session_forbidden"),
+    ).toMatchObject({
+      action: "new-session",
+    })
     expect(presentAssistantError("Server returned 431.")).toMatchObject({
       action: "reload",
     })

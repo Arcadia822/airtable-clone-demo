@@ -106,7 +106,7 @@ const ownershipArgs = {
   userId: v.string(),
 };
 
-async function requireOwnedSession(
+async function findOwnedSession(
   ctx: Pick<QueryCtx, "db"> | Pick<MutationCtx, "db">,
   organizationId: string,
   userId: string,
@@ -118,12 +118,27 @@ async function requireOwnedSession(
       q.eq("externalSessionId", externalSessionId),
     )
     .unique();
-  if (
-    !session ||
-    session.orgId !== organizationId ||
-    session.ownerUserId !== userId ||
-    session.status !== "active"
-  ) {
+  return session &&
+    session.orgId === organizationId &&
+    session.ownerUserId === userId &&
+    session.status === "active"
+    ? session
+    : null;
+}
+
+async function requireOwnedSession(
+  ctx: Pick<QueryCtx, "db"> | Pick<MutationCtx, "db">,
+  organizationId: string,
+  userId: string,
+  externalSessionId: string,
+) {
+  const session = await findOwnedSession(
+    ctx,
+    organizationId,
+    userId,
+    externalSessionId,
+  );
+  if (!session) {
     throw new ConvexError({ code: "EVE_SESSION_FORBIDDEN" });
   }
   return session;
@@ -195,15 +210,15 @@ export const assertOwnership = internalQuery({
     ...ownershipArgs,
     sessionId: v.string(),
   },
-  returns: v.object({ allowed: v.literal(true) }),
+  returns: v.object({ allowed: v.boolean() }),
   handler: async (ctx, args) => {
-    await requireOwnedSession(
+    const session = await findOwnedSession(
       ctx,
       args.organizationId,
       args.userId,
       args.sessionId,
     );
-    return { allowed: true as const };
+    return { allowed: session !== null };
   },
 });
 
@@ -212,7 +227,7 @@ export const assertContinuationOwnership = internalQuery({
     ...ownershipArgs,
     continuationTokenHash: v.string(),
   },
-  returns: v.object({ allowed: v.literal(true) }),
+  returns: v.object({ allowed: v.boolean() }),
   handler: async (ctx, args) => {
     const session = await ctx.db
       .query("aiSessions")
@@ -220,15 +235,13 @@ export const assertContinuationOwnership = internalQuery({
         q.eq("continuationTokenHash", args.continuationTokenHash),
       )
       .unique();
-    if (
-      !session ||
-      session.orgId !== args.organizationId ||
-      session.ownerUserId !== args.userId ||
-      session.status !== "active"
-    ) {
-      throw new ConvexError({ code: "EVE_SESSION_FORBIDDEN" });
-    }
-    return { allowed: true as const };
+    return {
+      allowed:
+        session !== null &&
+        session.orgId === args.organizationId &&
+        session.ownerUserId === args.userId &&
+        session.status === "active",
+    };
   },
 });
 
