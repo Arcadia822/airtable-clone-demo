@@ -1,0 +1,62 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+/node_modules
+/.pnpm-store
+/.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# testing
+/coverage
+/playwright-report/
+/test-results/
+/playwright/.clerk/
+/playwright/.auth/
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+/.eve/
+/.output/
+
+# misc
+.DS_Store
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*.json
+*.log
+
+# local agent tooling
+/.agents/
+/.claude/
+/AGENTS.md
+/CLAUDE.md
+/skills-lock.json
+/convex/_generated/ai/ai-files.state.json
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# env files (can opt-in for committing if needed)
+.env*
+!.env.example
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
