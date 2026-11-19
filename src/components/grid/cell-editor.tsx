@@ -111,6 +111,14 @@ export function CellEditor({
     onCommit(next)
   }
 
+  if (field.type === "autoNumber") {
+    return (
+      <span className="block truncate px-2.5 text-xs font-mono text-muted-foreground">
+        {typeof value === "number" ? value : "—"}
+      </span>
+    )
+  }
+
   if (field.type === "createdTime") {
     const timestamp = typeof value === "number" ? value : null
     return (
@@ -317,7 +325,10 @@ export function CellEditor({
     )
   }
 
-  if (field.type === "attachment") {
+  if (field.type === "attachment" || field.type === "image") {
+    const isSingleImage = field.type === "image"
+    const effectiveKind = isSingleImage ? "image" : field.config.attachmentKind
+    const maxItems = isSingleImage ? 1 : MAX_ATTACHMENTS_PER_CELL
     const attachments = Array.isArray(draft)
       ? draft.filter(
           (item): item is AttachmentValue =>
@@ -332,19 +343,18 @@ export function CellEditor({
           type="file"
           aria-label={`Choose files for ${accessibleLabel}`}
           className="hidden"
-          accept={attachmentAccept(field.config.attachmentKind)}
-          multiple
+          accept={attachmentAccept(effectiveKind)}
+          multiple={!isSingleImage}
           onChange={async (event) => {
             const selectedFiles = Array.from(event.target.files ?? [])
-            const remainingSlots = Math.max(
-              0,
-              MAX_ATTACHMENTS_PER_CELL - attachments.length,
-            )
+            const remainingSlots = isSingleImage
+              ? 1
+              : Math.max(0, maxItems - attachments.length)
             const files = selectedFiles
               .filter((file) => {
                 const kindError = attachmentKindErrorMessage(
                   file,
-                  field.config.attachmentKind,
+                  effectiveKind,
                 )
                 if (kindError) {
                   toast.error(kindError)
@@ -355,8 +365,8 @@ export function CellEditor({
                 return false
               })
               .slice(0, remainingSlots)
-            if (selectedFiles.length > remainingSlots) {
-              toast.error(`A cell can contain up to ${MAX_ATTACHMENTS_PER_CELL} files`)
+            if (!isSingleImage && selectedFiles.length > remainingSlots) {
+              toast.error(`A cell can contain up to ${maxItems} files`)
             }
             event.target.value = ""
             if (!files.length) return
@@ -380,7 +390,7 @@ export function CellEditor({
               size: file.size,
               url: file.type.startsWith("image/") ? URL.createObjectURL(file) : undefined,
             }))
-            commit([...attachments, ...next])
+            commit(isSingleImage ? next.slice(0, 1) : [...attachments, ...next])
           }}
         />
         {attachments.slice(0, 2).map((attachment) => {
@@ -436,7 +446,7 @@ export function CellEditor({
           className="grid size-6 shrink-0 place-items-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"
           onClick={() => fileInputRef.current?.click()}
           disabled={
-            uploading || attachments.length >= MAX_ATTACHMENTS_PER_CELL
+            uploading || (!isSingleImage && attachments.length >= maxItems)
           }
         >
           {uploading ? (

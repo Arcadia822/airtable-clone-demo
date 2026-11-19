@@ -13,10 +13,48 @@ export const FIELD_TYPES = [
   "singleSelect",
   "multiSelect",
   "attachment",
+  "image",
+  "autoNumber",
   "createdTime",
   "createdBy",
 ] as const
 
+export const VIEW_TYPES = [
+  "grid",
+  "kanban",
+  "timeline",
+  "calendar",
+  "gallery",
+  "dashboard",
+] as const
+
+export type ViewType = (typeof VIEW_TYPES)[number]
+
+export interface DashboardWidgetConfig {
+  id: string
+  kind: "metric" | "chart"
+  title: string
+  fieldId?: string
+  groupByFieldId?: string
+  aggregate?: "count" | "populated" | "sum" | "avg" | "min" | "max"
+  chartType?: "bar" | "line" | "pie"
+  rank: string
+}
+
+export interface SavedViewConfiguration {
+  rowHeight?: "short" | "medium" | "tall"
+  kanbanFieldId?: string
+  kanbanSummaryFieldIds?: string[]
+  calendarDateFieldId?: string
+  calendarDisplay?: "month" | "week"
+  galleryCoverFieldId?: string
+  gallerySummaryFieldIds?: string[]
+  timelineStartFieldId?: string
+  timelineEndFieldId?: string
+  timelineGroupFieldId?: string
+  timelineScale?: "day" | "week" | "month"
+  dashboardWidgets?: DashboardWidgetConfig[]
+}
 export type FieldType = (typeof FIELD_TYPES)[number]
 
 export interface SelectOption {
@@ -175,7 +213,9 @@ export interface FormDefinition {
 
 export type AppErrorCode =
   | "UNAUTHENTICATED"
+  | "UNAUTHORIZED"
   | "FORBIDDEN"
+  | "NOT_FOUND"
   | "QUOTA_EXCEEDED"
   | "FORM_UPDATED"
   | "FORM_CLOSED"
@@ -183,7 +223,6 @@ export type AppErrorCode =
   | "REVISION_CONFLICT"
   | "VALIDATION_ERROR"
   | "BILLING_UNAVAILABLE"
-
 export class AppError extends Error {
   constructor(
     public readonly code: AppErrorCode,

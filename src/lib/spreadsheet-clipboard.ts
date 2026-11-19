@@ -267,9 +267,12 @@ export function formatClipboardCellValue(
       ? localDateTime(value)
       : localDate(value)
   }
-  if (field.type === "attachment") {
+  if (field.type === "attachment" || field.type === "image") {
     const names = attachmentNames(value)
-    return names.length ? names.join(", ") : "Files attached"
+    return names.length ? names.join(", ") : field.type === "image" ? "Image attached" : "Files attached"
+  }
+  if (field.type === "autoNumber" && typeof value === "number") {
+    return String(value)
   }
   if (
     field.type === "createdBy" &&
@@ -598,6 +601,7 @@ export function convertClipboardCell(
   field: FieldDefinition,
 ): ClipboardCellConversion {
   if (
+    field.type === "autoNumber" ||
     field.type === "createdTime" ||
     field.type === "createdBy"
   ) {
@@ -607,7 +611,7 @@ export function convertClipboardCell(
       message: `${field.name} is filled in automatically and cannot be pasted.`,
     }
   }
-  if (field.type === "attachment") {
+  if (field.type === "attachment" || field.type === "image") {
     return {
       ok: false,
       code: "file_upload_required",

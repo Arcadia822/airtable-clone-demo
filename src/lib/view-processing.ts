@@ -206,7 +206,7 @@ function searchableTokens(
   if (field.type === "singleSelect" || field.type === "multiSelect") {
     return selectTokens(field, value)
   }
-  if (field.type === "attachment") {
+  if (field.type === "attachment" || field.type === "image") {
     return attachmentNames(value).map(normalizedText)
   }
   if (Array.isArray(value)) {
@@ -302,7 +302,8 @@ function compareValues(
     field.type === "number" ||
     field.type === "currency" ||
     field.type === "percent" ||
-    field.type === "rating"
+    field.type === "rating" ||
+    field.type === "autoNumber"
   ) {
     const leftNumber = finiteNumber(left)
     const rightNumber = finiteNumber(right)
@@ -346,7 +347,7 @@ function comparableText(
       .sort((left, right) => textCollator.compare(left, right))
       .join(", ")
   }
-  if (field.type === "attachment") return attachmentNames(value).join(", ")
+  if (field.type === "attachment" || field.type === "image") return attachmentNames(value).join(", ")
   if (
     field.type === "createdBy" &&
     typeof value === "string" &&
@@ -552,9 +553,9 @@ function groupLabel(
         : {}),
     }).format(parsed)
   }
-  if (field.type === "attachment") {
+  if (field.type === "attachment" || field.type === "image") {
     const names = attachmentNames(value)
-    return names.length ? names.join(", ") : "Files attached"
+    return names.length ? names.join(", ") : field.type === "image" ? "Image attached" : "Files attached"
   }
   if (
     field.type === "createdBy" &&
@@ -589,6 +590,7 @@ function compareGroupBuckets(
     field.type === "currency" ||
     field.type === "percent" ||
     field.type === "rating" ||
+    field.type === "autoNumber" ||
     field.type === "date" ||
     field.type === "createdTime" ||
     field.type === "checkbox"

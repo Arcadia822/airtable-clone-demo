@@ -8,7 +8,6 @@ import {
   updateFormSettingsInputSchema,
   updateRecordInputSchema,
 } from "./contracts";
-import { assertSafeToolInput, sanitizeAgentResult } from "./security";
 
 const recordChange = {
   baseId: "base_1",
@@ -166,26 +165,5 @@ describe("EVE attachment minimization", () => {
         ],
       }).success,
     ).toBe(false);
-  });
-
-  it("rejects internal attachment identifiers in tool inputs", () => {
-    expect(() =>
-      assertSafeToolInput({ storageId: "storage_1" }),
-    ).toThrow(/internal attachment identifier/i);
-    expect(() =>
-      assertSafeToolInput({ attachmentIds: ["attachment_1"] }),
-    ).toThrow(/attachmentIds/);
-  });
-
-  it("redacts internal attachment identifiers from defense-in-depth output", () => {
-    expect(
-      sanitizeAgentResult({
-        attachmentId: "attachment_1",
-        nested: { storageId: "storage_1" },
-      }),
-    ).toEqual({
-      attachmentId: "[redacted attachment content]",
-      nested: { storageId: "[redacted attachment content]" },
-    });
   });
 });

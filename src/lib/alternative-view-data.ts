@@ -186,7 +186,7 @@ export function galleryCover(
   record: GridRecord,
   coverField?: FieldDefinition,
 ): AttachmentValue | undefined {
-  if (!coverField || coverField.type !== "attachment") return undefined
+  if (!coverField || (coverField.type !== "attachment" && coverField.type !== "image")) return undefined
   const value = record.values[coverField.id]
   if (!Array.isArray(value)) return undefined
   return value.find(
@@ -196,6 +196,39 @@ export function galleryCover(
       "name" in item &&
       typeof item.name === "string",
   )
+}
+
+export type TimelineBar = {
+  record: GridRecord
+  start: Date
+  end: Date
+}
+
+export function buildTimelineBars(
+  records: readonly GridRecord[],
+  startField: FieldDefinition,
+  endField?: FieldDefinition,
+): {
+  bars: TimelineBar[]
+  unscheduled: GridRecord[]
+} {
+  const bars: TimelineBar[] = []
+  const unscheduled: GridRecord[] = []
+  for (const record of records) {
+    const startDate = calendarDateFromValue(record.values[startField.id])
+    if (!startDate) {
+      unscheduled.push(record)
+      continue
+    }
+    const rawEnd = endField ? calendarDateFromValue(record.values[endField.id]) : undefined
+    const endDate = rawEnd && rawEnd.getTime() >= startDate.getTime() ? rawEnd : startDate
+    bars.push({
+      record,
+      start: startDate,
+      end: endDate,
+    })
+  }
+  return { bars, unscheduled }
 }
 
 export function friendlyRecordDetails(

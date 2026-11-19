@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import { GeistMono } from "geist/font/mono";
 import { GeistSans } from "geist/font/sans";
 
-import { VisualProviders } from "@/components/visual-providers"
+import { Providers } from "@/components/providers"
 import { HydrationMarker } from "@/components/hydration-marker"
 import { BRAND } from "@/lib/brand"
 
@@ -31,10 +31,10 @@ export default function RootLayout({
       <body
         className={`${GeistSans.variable} ${GeistMono.variable} min-h-dvh bg-background font-sans text-foreground antialiased`}
       >
-        <VisualProviders>
+        <Providers>
           <HydrationMarker />
           {children}
-        </VisualProviders>
+        </Providers>
       </body>
     </html>
   );
