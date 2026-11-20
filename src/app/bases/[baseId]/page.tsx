@@ -27,25 +27,27 @@ export default async function BasePage({
   }
 
   const db = await getDb()
+  let dashboard: Awaited<ReturnType<typeof getBaseDashboard>>
   try {
-    const dashboard = await getBaseDashboard(db, session.orgId, baseId)
-    return (
-      <BaseOverview
-        base={{
-          id: dashboard.base.id,
-          name: dashboard.base.name,
-          description: dashboard.base.description,
-          color: dashboard.base.color,
-        }}
-        counts={dashboard.counts}
-        forms={dashboard.forms}
-        tables={dashboard.tables}
-      />
-    )
+    dashboard = await getBaseDashboard(db, session.orgId, baseId)
   } catch (error) {
     if (error instanceof AppError && error.code === "NOT_FOUND") {
       redirect("/bases")
     }
     throw error
   }
+
+  return (
+    <BaseOverview
+      base={{
+        id: dashboard.base.id,
+        name: dashboard.base.name,
+        description: dashboard.base.description,
+        color: dashboard.base.color,
+      }}
+      counts={dashboard.counts}
+      forms={dashboard.forms}
+      tables={dashboard.tables}
+    />
+  )
 }

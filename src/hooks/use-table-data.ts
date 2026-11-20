@@ -235,31 +235,36 @@ export function useTableData(tableId: string) {
 
   useEffect(() => {
     let cancelled = false
-    setLoading(true)
-    setBundle(undefined)
-    setActiveViewId(undefined)
-    setRecords([])
-    setSearch("")
-    ;(async () => {
-      try {
-        const loaded = await loadBundle()
-        if (cancelled) return
-        await runQuery(loaded.view, "")
-        if (cancelled) return
-        setError(undefined)
-      } catch (loadError) {
-        if (cancelled) return
-        setError(
-          loadError instanceof Error
-            ? loadError.message
-            : "Could not load this table.",
-        )
-      } finally {
-        if (!cancelled) setLoading(false)
-      }
-    })()
+    // Bootstrap on the next tick: state may only be reset from an async
+    // callback, never while the effect body is running.
+    const handle = window.setTimeout(() => {
+      setLoading(true)
+      setBundle(undefined)
+      setActiveViewId(undefined)
+      setRecords([])
+      setSearch("")
+      void (async () => {
+        try {
+          const loaded = await loadBundle()
+          if (cancelled) return
+          await runQuery(loaded.view, "")
+          if (cancelled) return
+          setError(undefined)
+        } catch (loadError) {
+          if (cancelled) return
+          setError(
+            loadError instanceof Error
+              ? loadError.message
+              : "Could not load this table.",
+          )
+        } finally {
+          if (!cancelled) setLoading(false)
+        }
+      })()
+    }, 0)
     return () => {
       cancelled = true
+      window.clearTimeout(handle)
     }
     // Re-running on tableId only: view and search changes go through explicit
     // actions so a re-render never refetches the workspace.

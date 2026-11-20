@@ -20,7 +20,6 @@ import { toast } from "sonner"
 import { AssistantDock } from "@/components/assistant/assistant-dock"
 import { AssistantPanel } from "@/components/assistant/assistant-panel"
 import { DataGrid } from "@/components/grid/data-grid"
-import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
 import { CalendarView } from "@/components/views/calendar-view"
 import { DashboardView } from "@/components/views/dashboard-view"
@@ -114,7 +113,6 @@ export function TableWorkspace({
 
   const {
     activeView,
-    activeViewId,
     applySearch,
     clearError,
     controls,
@@ -149,8 +147,12 @@ export function TableWorkspace({
   }, [clearError, error])
 
   useEffect(() => {
-    const recordId = searchParams.get("record")
-    if (recordId) setDeepLinkRecordId(recordId)
+    // Read the deep link after paint so the drawer opens against loaded rows.
+    const handle = window.setTimeout(() => {
+      const recordId = searchParams.get("record")
+      if (recordId) setDeepLinkRecordId(recordId)
+    }, 0)
+    return () => window.clearTimeout(handle)
   }, [searchParams])
 
   const openAssistant = useCallback(() => setAssistantOpen(true), [])

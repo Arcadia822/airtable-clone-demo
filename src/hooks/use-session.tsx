@@ -70,7 +70,9 @@ export function SessionProvider({ children }: { children: ReactNode }) {
   }, [refresh])
 
   useEffect(() => {
-    void refresh()
+    // Defer the probe so the session request runs after the first paint.
+    const handle = window.setTimeout(() => void refresh(), 0)
+    return () => window.clearTimeout(handle)
   }, [refresh])
 
   return (

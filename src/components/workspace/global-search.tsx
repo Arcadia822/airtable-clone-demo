@@ -107,38 +107,43 @@ export function GlobalSearchDialog({
 
   useEffect(() => {
     const trimmed = query.trim()
-    if (!open || !trimmed) {
-      setResults(EMPTY_RESULTS)
-      setRecordHits([])
-      setSearching(false)
-      return
-    }
     const controller = new AbortController()
-    const handle = window.setTimeout(async () => {
-      setSearching(true)
-      try {
-        const params = new URLSearchParams({ q: trimmed })
-        const recordParams = new URLSearchParams({ q: trimmed, limit: "12" })
-        if (baseId) recordParams.set("baseId", baseId)
-        const [destinations, records] = await Promise.all([
-          readJson<WorkspaceSearchResult>(`/api/search?${params}`, controller.signal),
-          readJson<{ results: RecordSearchHit[] }>(
-            `/api/search/records?${recordParams}`,
-            controller.signal,
-          ),
-        ])
-        if (controller.signal.aborted) return
-        setResults(destinations ?? EMPTY_RESULTS)
-        setRecordHits(records?.results ?? [])
-      } catch {
-        if (!controller.signal.aborted) {
+    // Stay idle until the dialog opens with a query; the reset happens inside
+    // the debounced callback so the effect never sets state while rendering.
+    const handle = window.setTimeout(
+      async () => {
+        if (!open || !trimmed) {
           setResults(EMPTY_RESULTS)
           setRecordHits([])
+          setSearching(false)
+          return
         }
-      } finally {
-        if (!controller.signal.aborted) setSearching(false)
-      }
-    }, 200)
+        setSearching(true)
+        try {
+          const params = new URLSearchParams({ q: trimmed })
+          const recordParams = new URLSearchParams({ q: trimmed, limit: "12" })
+          if (baseId) recordParams.set("baseId", baseId)
+          const [destinations, records] = await Promise.all([
+            readJson<WorkspaceSearchResult>(`/api/search?${params}`, controller.signal),
+            readJson<{ results: RecordSearchHit[] }>(
+              `/api/search/records?${recordParams}`,
+              controller.signal,
+            ),
+          ])
+          if (controller.signal.aborted) return
+          setResults(destinations ?? EMPTY_RESULTS)
+          setRecordHits(records?.results ?? [])
+        } catch {
+          if (!controller.signal.aborted) {
+            setResults(EMPTY_RESULTS)
+            setRecordHits([])
+          }
+        } finally {
+          if (!controller.signal.aborted) setSearching(false)
+        }
+      },
+      open && trimmed ? 200 : 0,
+    )
     return () => {
       controller.abort()
       window.clearTimeout(handle)

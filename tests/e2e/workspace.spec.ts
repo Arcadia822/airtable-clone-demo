@@ -13,7 +13,6 @@ test.describe.configure({ mode: "serial" })
 const AI_UNAVAILABLE =
   "The AI assistant is not available right now. Try again in a moment."
 
-let basePath = ""
 let tablePath = ""
 
 function primaryInputs(page: Page): Locator {
@@ -62,7 +61,6 @@ test("seeded workspace opens the table with six auto-numbered rows", async ({
 
   await expect(page).toHaveURL(/\/bases\/[^/]+\/tables\/[^/]+$/)
   tablePath = new URL(page.url()).pathname
-  basePath = tablePath.split("/").slice(0, 3).join("/")
 
   await expect(page.getByRole("grid", { name: "Records grid" })).toBeVisible()
   await expect(page.getByLabel("Record count")).toHaveText("6 records")
