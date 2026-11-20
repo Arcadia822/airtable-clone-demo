@@ -150,5 +150,5 @@ drizzle/                 schema and migrations
 tests/e2e/               Playwright workspace suite
 ```
 
-`docs/architecture.md` still describes the earlier Clerk/Convex design and is not
-updated here.
+`docs/architecture.md` documents the shipped trust boundaries, data model,
+attachment storage, views, forms, auth, AI flow, and deployment.

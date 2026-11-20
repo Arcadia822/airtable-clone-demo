@@ -1,133 +1,79 @@
 # Basecraft architecture
 
+The upstream demo ran on Convex, Clerk, and EVE; that stack has been removed, and this document describes the shipped code.
+
 ## Trust boundaries
 
-Clerk authenticates users, owns organization memberships and roles, and is the
-only billing authority. Convex stores application data and derives the active
-organization, user, role, plans, and features from the verified Clerk identity.
-Client arguments never select an organization.
-
-Anonymous public form submissions have no Clerk session. A server-only action
-resolves the form owner, checks the current Clerk organization subscription on
-demand, validates Turnstile, and invokes one internal Convex transaction.
-Public reads and submission starts share a bounded 30-second in-memory Clerk
-lookup cache; the final commit always fetches fresh entitlements. The
-short-lived submission session records only its start-time quota class so file
-uploads do not call Clerk once per file. These checks deliberately fail closed
-when Clerk Billing is unavailable; no durable subscription state is mirrored
-into Convex.
+- The browser is untrusted. `getServerSession()` and `requireSession()` in `src/server/auth.ts` derive `userId` and `orgId`; client input never selects an organization. Service queries filter by `session.orgId`.
+- Workspace API routes call `requireSession`. The unauthenticated surfaces are `/api/auth/*`, `/api/public/forms/*`, `/f/[slug]`, the `publicFormSlug` branch of the attachment session/upload/finalize routes, and `/api/files/[attachmentId]` when a published form for the attachment's table grants read access.
+- Public form reads and submissions resolve only the current published version. Answers are accepted only for field ids that version maps; hidden questions are ignored.
+- Anonymous uploads use a 15-minute session bound to the published form's table. Finalization verifies the storage key belongs to the session and moves the chunks; authenticated sessions default to one hour.
+- AI credentials are read server-side from the environment. Model output is never executed as code or SQL: writes become a proposal that a signed-in member must approve through `/api/ai/tools/write`.
 
 ## Data model
 
-The hierarchy is:
+The hierarchy is `bases` → `tables` → `fields` and `records`; `views` belong to a table, and `forms` target one table. Workspace rows carry `orgId`; child rows such as `field_sequences` and `attachment_chunks` inherit it through their parent. Active rows use `status = "active"`, and deletion is archival.
 
-```text
-Clerk organization
-└── base
-    ├── table
-    │   ├── field definitions
-    │   ├── record documents
-    │   └── saved views
-    │       └── per-view field presentation
-    └── forms
-        ├── editable draft questions
-        ├── immutable published versions
-        └── submissions
-```
+User columns are metadata, not schema. `fields` stores `name`, `type`, `config` (JSONB), `rank`, `width`, `isPrimary`, and `frozen`; `records.values` is a JSONB object keyed by field id. Adding, renaming, retyping, or archiving a column writes only these rows and never runs DDL. `rank` is a fractional string index ordering bases, tables, fields, records, views, and per-view fields.
 
-Each record is one Convex document whose `values` map is keyed by stable field
-IDs. One-document rows keep realtime pages bounded and make a form submission
-atomic. All semantic validation is field-aware on the server. Fractional string
-ranks order bases, tables, fields, rows, views, and per-view field presentation
-without a shared counter hotspot.
+`records` also stores `revision` (optimistic concurrency through optional `expectedRevision`), `createdBy`/`updatedBy`, and `searchText`. `buildRecordSearchText` (`src/server/search-text.ts`) flattens values plus field configuration — select option labels, currency renderings, attachment names — into lowercase `searchText`. Record writes, field archive/restore, auto-number backfill, and select-label edits rebuild it; record search queries it with `position()`, while workspace name search uses `ILIKE`.
 
-The checked-in `convex/_generated` bootstrap files allow the repository to
-compile before a deployment is linked. They are not generated-schema or
-deployment proof. An authenticated `convex dev` or `convex deploy` run must
-replace them with deployment-generated contracts before production validation.
+`field_sequences` (`fieldId` primary key, `tableId`, `nextValue`) backs `autoNumber` fields. The row is created with the field, allocated by every record-creating path, and rebuilt in rank order when an auto-number column is added or restored.
 
-Every tenant document repeats the Clerk organization ID and has a compound
-index that starts with its parent and active/deleted status. Queries use
-indexes and pagination; unbounded `collect()` and per-cell subscriptions are
-not permitted.
+`drizzle/schema.ts` and the committed SQL in `drizzle/` are the only schema authority. There is no per-workspace DDL.
 
-## Realtime editing
+## Attachments
 
-The grid subscribes once to the field list and once to paginated rows. It
-virtualizes visible rows with TanStack Table and TanStack Virtual, and renders
-only the frozen columns plus the horizontally visible column window. The
-windowing helpers keep logical selection and keyboard navigation independent
-from which rows and columns are mounted.
-Human edits target one cell; Convex optimistic concurrency retries preserve
-different-cell edits on the same row. The latest committed edit wins for the
-same cell.
+- `attachments` is metadata: `tableId`, optional `recordId`/`fieldId`, `name`, `mimeType`, `size`, `storageKey`, and `status`. Bytes live in `attachment_chunks` as 1 MiB `bytea` rows keyed by `(attachment_id, seq)`; `attachment_blobs` records total size and chunk count.
+- Upload flow: `POST /api/attachments/session` → `POST /api/attachments/upload/[sessionId]` (stores the body as 1 MiB chunks) → `POST /api/attachments/finalize`. Finalize verifies the storage key, moves the chunk rows to the new attachment id, writes `attachment_blobs`, and consumes the session in one transaction.
+- `src/server/storage/` hides the backend. `PostgresAttachmentStorage` is the default and the only durable option on a Worker; `ATTACHMENT_STORAGE=fs` dynamically loads a filesystem adapter for local debugging.
+- Limits are 25 MB per file (`MAX_FILE_BYTES`), 10 attachments per cell, and one file for an image cell.
 
-Views with filters, sorts, or groups use a versioned server-side
-materialization. Bounded jobs scan the whole table, catch up from a per-table
-change log, and atomically make a completed generation active. Pages therefore
-remain correctly filtered and ordered beyond the first 100 records, while the
-client shows a named preparation state during a rebuild. Record, attachment,
-form-submission, and approved AI writes all append to the same bounded change
-path. A previous same-view snapshot can finish an already-running subscription
-during the brief invalidation race, but the status subscription keeps it hidden
-until the current generation is ready.
+## Views and dashboards
 
-EVE record updates/deletions and field deletions include an expected revision.
-A stale proposal fails instead of overwriting newer human work.
+A `views` row stores `type`, `visibility`, `isDefault`, `filterConjunction`, `filters`/`sorts`/`groups` (JSONB), and `configuration` (JSONB). `view_field_configs` stores per-view `hidden`, `frozen`, `width`, `rank`, and `formatting`, unique on `(viewId, fieldId)`.
 
-## Form publishing and files
+Six types ship: `grid`, `kanban`, `timeline`, `calendar`, `gallery`, and `dashboard` (`VIEW_TYPES` in `src/lib/domain.ts`). `validateViewConfiguration` (`src/server/services/views.ts`) enforces each type's required columns; dashboard widgets live in `configuration.dashboardWidgets` as at most 12 `metric` or `chart` entries with an optional `aggregate` and, for charts, a `groupByFieldId`.
 
-A form targets one table. Draft questions map to stable field IDs. Publishing
-validates every mapping and creates immutable form-version and question
-snapshots. Public submissions target only the currently published version and
-create one record plus one submission receipt atomically.
+Filtering, sorting, and grouping have one implementation in `src/lib/view-processing.ts` (`processSavedView`). `queryRecords` applies it server-side after a `searchText` prefilter, and the grid uses the same semantics client-side. Records are never materialized per view.
 
-New public links are generated from the form's readable name, with numeric
-suffixes for collisions. A bounded migration replaces legacy links containing
-internal or random values and stores the old address as an alias, so an
-already-shared link still resolves and is then canonicalized in the browser.
+## Forms
 
-Attachments use a staged upload session:
+A form belongs to one base and one table. `form_draft_fields` holds editable questions mapped to `targetFieldId`; `generateFormDraft` (`src/server/services/forms.ts`) builds questions from eligible columns and skips read-only types (`autoNumber`, `createdTime`, `createdBy`).
 
-1. create a short-lived upload session;
-2. upload directly to Convex storage;
-3. finalize verified metadata and reserve quota;
-4. claim the attachment in a record or form submission;
-5. delete expired, unclaimed blobs in bounded scheduled work;
-6. sweep the `_storage` system table with a persistent cursor so raw uploads
-   abandoned before finalization are also reclaimed after a safety window.
+Publishing validates that every mapped column still exists and is writable, then inserts an immutable `form_versions` row plus `form_version_fields` snapshots (label, type, config, requirement, visibility rules) and points `forms.publishedVersionId` at it. The draft can keep changing; the published version does not.
 
-Only authorized calls receive generated bearer URLs. Raw storage IDs and URLs
-never enter EVE.
+`/f/[slug]` and `/api/public/forms/[slug]` resolve only the current `publishedVersionId`. Submission validates answers against the snapshot, ignores hidden questions, allocates auto-numbers, rebuilds `searchText`, inserts a real `records` row, then a `form_submissions` receipt; if the receipt insert fails, the record is deleted. `form_metric_buckets` stores daily `view`, `start`, and `submission` counters by form, day, and breakdown.
 
-## Analytics and AI
+## Authentication
 
-Form analytics stores sharded daily counters for views, starts, validation
-failures, successful submissions, and best-effort exits. Device and traffic
-reports use coarse categories calculated in the browser; raw screen details,
-referrer URLs, and user agents are never sent. Question-exit counters retain
-only the immutable published-question reference needed to show its name and
-never include an answer or file.
+`src/server/auth.ts` uses the Factory visitor-auth service when `FACTORY_VISITOR_AUTH_URL` and `FACTORY_VISITOR_AUTH_TOKEN` are set. It calls `GET /session` with a bearer token and `x-factory-visitor-origin`, and forwards cookies opaquely. `/api/auth/login` and `/register` POST `/authorize` with a random state cookie; `/api/auth/callback` verifies state and POSTs `/exchange`, forwarding `Set-Cookie`; `/api/auth/logout` proxies `/logout`.
 
-Each form locks an IANA analytics timezone when it is first published. Public
-events and submissions derive their reporting day from that server-owned
-timezone, and report ranges use timezone- and daylight-saving-aware local
-midnights. Legacy published forms remain on UTC so existing daily counters are
-never silently reinterpreted.
+With either variable missing, `getServerSession` returns the local single-tenant workspace (`local-user`, `local-org`, `authMode: "local"`), and the login/logout routes no-op. There is one `orgId` per deployment: no memberships, roles, or billing. `FACTORY_PREVIEW_HOST` supplies the origin sent to visitor auth on preview deployments.
 
-Opaque first-party visitor IDs are HMACed per form and day for best-effort
-deduplication. Those daily matching rows are removed after 100 days in bounded
-batches. Aggregate counters remain available with the form, including after it
-is closed or archived. Raw events, IPs, referrer URLs, user agents, cookies,
-form values, and attachment metadata are not analytics data. Reports read a
-maximum 90-day range, use bounded samples for answer and question-exit
-summaries, and clearly disclose when a sample limit applies.
+## AI assistant
 
-The EVE assistant uses bounded tools to describe schema, page or sample rows,
-calculate labelled summaries, and inspect form analytics. Mutating tools are
-granular and always require approval. The executor derives identity from the
-current EVE session and signs the method, route, timestamp, one-time nonce, and
-exact command body. Every turn is metered once by durable `turnId`; repeated
-tool calls in that turn deduplicate. Writes use `eve:<sessionId>:<callId>` for
-idempotency. Convex applies the write, audit event, and command receipt in one
-transaction.
+`POST /api/ai/chat` is a Node route that streams SSE events: `delta`, `tool_result`, `chart`, `citations`, `proposal`, `done`, and `error`. It requires a session and accepts `{ requestId, messages, context }`.
+
+`src/server/ai/gateway.ts` calls Factory `app-ai` at `FACTORY_APP_AI_URL` with `FACTORY_APP_AI_TOKEN`. `LLM_GATEWAY_BASE_URL`/`API_KEY`/`MODEL` is an opt-in OpenAI-compatible fallback used only when the Factory URL is empty. Missing credentials produce an `ai-unavailable` error event rather than a fabricated answer.
+
+Read tools in `src/server/ai/tools.ts` run in-process against Drizzle, scoped to the session organization: `describe_table`, `list_records` (bounded pages), `summarize_table`, `inspect_form`, and `form_analytics`. The same tools are exposed at `/api/ai/tools/read`. For write intent the model returns a schema-constrained action; `buildWriteProposal` validates it and emits a `proposal` with diff and warnings without touching data. Approval POSTs `{ operation, input }` to `/api/ai/tools/write`, where `executeApprovedWrite` re-validates and applies it. Operations are `create_table`, `create_record`, `update_record`, `delete_record`, `create_field`, `delete_field`, `create_form`, `update_form_settings`, and `create_view`.
+
+`ai_reports` persists analysis reports with citations and optional chart configuration; `/api/ai/reports` serves them.
+
+## Deployment
+
+- Local: with no `DATABASE_URL`, the app uses PGlite at `.data/pglite`. `getDb()` applies the committed migrations from `drizzle/` once per process, and the first base listing seeds the demo workspace.
+- Neon: a URL containing `neon.tech` uses the Neon HTTP driver. Runtime migration is PGlite-only, so run `pnpm db:migrate` before serving Postgres or Neon. `drizzle/` is authoritative; a host that rejects a non-empty baseline needs an explicit baseline step.
+- Factory previews receive a Neon `preview/<branch>` database branch and an injected `DATABASE_URL`.
+- Publish builds the repository with the platform's pinned Next.js 16.4.1 and OpenNext 1.20.15 toolchain into a Cloudflare Worker. The Worker filesystem is read-only, which is why attachment bytes default to Postgres.
+- `pnpm build` and `pnpm start` run the same app locally. CI (`.github/workflows/ci.yml`) runs lint, typecheck, Vitest, the production build, and Playwright.
+
+## Known limits
+
+- Attachment bytes live in Postgres with a 25 MB per-file cap; there is no S3/R2 adapter, and a large store grows the database.
+- The table page is client-fetch: it renders a shell and loads records from `/api/tables/[tableId]/records/query`, so first paint is a loading state.
+- UI copy and seeded records are English-only; search is CJK-aware.
+- One tenant per deployment: no workspaces, roles, or billing.
+- PGlite is single-process; several app instances must not share one embedded directory.
+- AI streaming and approvals are not verified against live Factory credentials in this repository.
