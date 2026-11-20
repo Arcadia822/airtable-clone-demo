@@ -15,6 +15,20 @@
       "when": 1795142811318,
       "tag": "0001_open_microchip",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1795146713967,
+      "tag": "0002_greedy_phantom_reporter",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1795147499659,
+      "tag": "0003_forms_ai_integrity",
+      "breakpoints": true
     }
   ]
 }

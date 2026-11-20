@@ -294,12 +294,22 @@ export function ConnectedPublicForm({
       answers[question.id] = raw
     }
 
+    // The public form stamps the Turnstile widget token onto the FormData. It
+    // must reach the server as `cf-turnstile-response`, or every submission is
+    // rejected once TURNSTILE_SECRET_KEY is configured. (The server also
+    // accepts the same value as a request header; this keeps the JSON path.)
+    const turnstileToken = data.get("cf-turnstile-response")
+    const requestBody: Record<string, unknown> = { answers }
+    if (typeof turnstileToken === "string" && turnstileToken.trim()) {
+      requestBody["cf-turnstile-response"] = turnstileToken.trim()
+    }
+
     const response = await fetch(
       `/api/public/forms/${encodeURIComponent(payload.slug)}/submit`,
       {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ answers }),
+        body: JSON.stringify(requestBody),
       },
     )
     const body = await readPayload<{
@@ -366,9 +376,12 @@ export function ConnectedPublicForm({
       style={{ background: payload.theme.background }}
     >
       <div className="mx-auto w-full max-w-3xl">
+        {/* Without a site key the widget never renders and the token below is
+            never stamped; keep both halves pointed at the same Turnstile pair. */}
         <PublicForm
           form={payload.form}
           fields={payload.fields}
+          turnstileSiteKey={process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY}
           prefillValues={prefillValues}
           onStart={() => trackMetric("start")}
           onSubmitData={submit}

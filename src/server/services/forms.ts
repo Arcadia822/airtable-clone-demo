@@ -1,4 +1,6 @@
-import { and, asc, desc, eq, inArray, sql } from "drizzle-orm"
+import { createHash } from "node:crypto"
+
+import { and, asc, desc, eq, inArray, isNull, sql } from "drizzle-orm"
 import { generateKeyBetween } from "jittered-fractional-indexing"
 import { customAlphabet, nanoid } from "nanoid"
 
@@ -48,6 +50,7 @@ import {
   createFormSubmissionsCsv,
   formSubmissionsCsvFileName,
 } from "@/lib/form-submissions"
+import { HttpStatusError } from "@/server/http"
 import { buildRecordSearchText } from "@/server/search-text"
 
 /* -------------------------------------------------------------------------- */
@@ -633,6 +636,7 @@ async function requireTable(
   return rows[0]
 }
 
+/** Archived forms behave as if deleted: no detail, no publish, no public URL. */
 async function requireForm(
   db: AppDb,
   orgId: string,
@@ -641,8 +645,39 @@ async function requireForm(
   const rows = await db
     .select()
     .from(forms)
-    .where(and(eq(forms.orgId, orgId), eq(forms.id, formId)))
+    .where(
+      and(
+        eq(forms.orgId, orgId),
+        eq(forms.id, formId),
+        isNull(forms.archivedAt),
+      ),
+    )
     .limit(1)
+  if (!rows[0]) throw new AppError("NOT_FOUND", "Form not found.")
+  return rows[0]
+}
+
+/**
+ * Locks the form row for the duration of a transaction. Serialising writes per
+ * form is what makes version numbering, draft replacement, and submission
+ * de-duplication deterministic instead of racy.
+ */
+async function lockForm(
+  db: AppDb,
+  orgId: string,
+  formId: string,
+): Promise<typeof forms.$inferSelect> {
+  const rows = await db
+    .select()
+    .from(forms)
+    .where(
+      and(
+        eq(forms.orgId, orgId),
+        eq(forms.id, formId),
+        isNull(forms.archivedAt),
+      ),
+    )
+    .for("update")
   if (!rows[0]) throw new AppError("NOT_FOUND", "Form not found.")
   return rows[0]
 }
@@ -765,7 +800,7 @@ export async function listForms(
   orgId: string,
   options: { baseId?: string; tableId?: string } = {},
 ): Promise<FormSummaryDto[]> {
-  const filters = [eq(forms.orgId, orgId)]
+  const filters = [eq(forms.orgId, orgId), isNull(forms.archivedAt)]
   if (options.baseId) filters.push(eq(forms.baseId, options.baseId))
   if (options.tableId) filters.push(eq(forms.tableId, options.tableId))
 
@@ -1075,15 +1110,28 @@ export async function updateForm(
   return getFormDetail(db, orgId, formId)
 }
 
+/**
+ * Archiving keeps the public URL dead (404) while versions, submissions, and
+ * their records stay recoverable — a hard delete used to erase all three.
+ */
 export async function deleteForm(
   db: AppDb,
   orgId: string,
   formId: string,
 ): Promise<{ deleted: true }> {
   await requireForm(db, orgId, formId)
-  await db
-    .delete(forms)
-    .where(and(eq(forms.orgId, orgId), eq(forms.id, formId)))
+  const archived = await db
+    .update(forms)
+    .set({ archivedAt: new Date(), updatedAt: new Date() })
+    .where(
+      and(
+        eq(forms.orgId, orgId),
+        eq(forms.id, formId),
+        isNull(forms.archivedAt),
+      ),
+    )
+    .returning({ id: forms.id })
+  if (!archived.length) throw new AppError("NOT_FOUND", "Form not found.")
   return { deleted: true }
 }
 
@@ -1154,85 +1202,89 @@ export async function replaceFormDraft(
   formId: string,
   input: unknown,
 ): Promise<{ fields: FormDraftFieldDto[] }> {
-  const form = await requireForm(db, orgId, formId)
   const body = inputObject(input)
   const entries = draftFieldsFromInput(body)
 
-  const fieldRows = await tableFieldRows(db, orgId, form.tableId)
-  const fieldsById = new Map(fieldRows.map((row) => [row.id, row]))
-  const existingRows = await draftRows(db, orgId, formId)
-  const existingIds = new Set(existingRows.map((row) => row.id))
-  const usedIds = new Set<string>()
-  const seenTargets = new Set<string>()
+  return db.transaction(async (rawTx) => {
+    const tx = rawTx as unknown as AppDb
+    const form = await lockForm(tx, orgId, formId)
 
-  const prepared = entries.map((entry, index) => {
-    const field = fieldsById.get(entry.targetFieldId)
-    if (!field) {
-      throw new AppError(
-        "VALIDATION_ERROR",
-        `Question ${index + 1} points to a column that is not in this table.`,
-      )
-    }
-    if (!isEligibleFormFieldType(field.type as FieldType)) {
-      throw new AppError(
-        "VALIDATION_ERROR",
-        `“${field.name}” is a read-only column and cannot be a form question.`,
-      )
-    }
-    if (seenTargets.has(entry.targetFieldId)) {
-      throw new AppError(
-        "VALIDATION_ERROR",
-        `“${field.name}” is used by more than one question.`,
-      )
-    }
-    seenTargets.add(entry.targetFieldId)
+    const fieldRows = await tableFieldRows(tx, orgId, form.tableId)
+    const fieldsById = new Map(fieldRows.map((row) => [row.id, row]))
+    const existingRows = await draftRows(tx, orgId, formId)
+    const existingIds = new Set(existingRows.map((row) => row.id))
+    const usedIds = new Set<string>()
+    const seenTargets = new Set<string>()
 
-    let id = `fdf_${nanoid(10)}`
-    if (entry.id && existingIds.has(entry.id) && !usedIds.has(entry.id)) {
-      id = entry.id
+    const prepared = entries.map((entry, index) => {
+      const field = fieldsById.get(entry.targetFieldId)
+      if (!field) {
+        throw new AppError(
+          "VALIDATION_ERROR",
+          `Question ${index + 1} points to a column that is not in this table.`,
+        )
+      }
+      if (!isEligibleFormFieldType(field.type as FieldType)) {
+        throw new AppError(
+          "VALIDATION_ERROR",
+          `“${field.name}” is a read-only column and cannot be a form question.`,
+        )
+      }
+      if (seenTargets.has(entry.targetFieldId)) {
+        throw new AppError(
+          "VALIDATION_ERROR",
+          `“${field.name}” is used by more than one question.`,
+        )
+      }
+      seenTargets.add(entry.targetFieldId)
+
+      let id = `fdf_${nanoid(10)}`
+      if (entry.id && existingIds.has(entry.id) && !usedIds.has(entry.id)) {
+        id = entry.id
+      }
+      usedIds.add(id)
+      return {
+        ...entry,
+        id,
+        fieldName: field.name,
+        rank: "",
+        index,
+      }
+    })
+
+    const ids = new Set(prepared.map((entry) => entry.id))
+    const ranks = draftRanks(prepared.length)
+    const rows = prepared.map((entry) => ({
+      id: entry.id,
+      orgId,
+      formId,
+      targetFieldId: entry.targetFieldId,
+      label: entry.label?.trim() || entry.fieldName,
+      helpText: entry.helpText ?? "",
+      placeholder: entry.placeholder ?? "",
+      required: entry.required ?? false,
+      hidden: entry.mode === "hidden",
+      rank: ranks[entry.index],
+      mode: entry.mode ?? "input",
+      visibilityRule: visibilityRule(entry.visibilityRule, entry.id, ids, {
+        strict: true,
+      }) as unknown as Record<string, unknown> | null,
+    }))
+
+    await tx
+      .delete(formDraftFields)
+      .where(
+        and(
+          eq(formDraftFields.orgId, orgId),
+          eq(formDraftFields.formId, formId),
+        ),
+      )
+    if (rows.length) {
+      await tx.insert(formDraftFields).values(rows)
     }
-    usedIds.add(id)
-    return {
-      ...entry,
-      id,
-      fieldName: field.name,
-      rank: "",
-      index,
-    }
+
+    return { fields: (await draftRows(tx, orgId, formId)).map(toDraftDto) }
   })
-
-  const ids = new Set(prepared.map((entry) => entry.id))
-  const ranks = draftRanks(prepared.length)
-  const rows = prepared.map((entry) => ({
-    id: entry.id,
-    orgId,
-    formId,
-    targetFieldId: entry.targetFieldId,
-    label: entry.label?.trim() || entry.fieldName,
-    helpText: entry.helpText ?? "",
-    placeholder: entry.placeholder ?? "",
-    required: entry.required ?? false,
-    hidden: entry.mode === "hidden",
-    rank: ranks[entry.index],
-    mode: entry.mode ?? "input",
-    visibilityRule: visibilityRule(entry.visibilityRule, entry.id, ids, {
-      strict: true,
-    }) as unknown as Record<string, unknown> | null,
-  }))
-
-  await db
-    .delete(formDraftFields)
-    .where(
-      and(
-        eq(formDraftFields.orgId, orgId),
-        eq(formDraftFields.formId, formId),
-      ),
-    )
-  if (rows.length) {
-    await db.insert(formDraftFields).values(rows)
-  }
-
-  return { fields: (await draftRows(db, orgId, formId)).map(toDraftDto) }
 }
 
 /**
@@ -1356,132 +1408,177 @@ export interface PublishFormResult {
   publicUrl: string
 }
 
+const MAX_PUBLISH_ATTEMPTS = 3
+
+/** Postgres unique violation, however the driver surfaces it. */
+function isUniqueViolation(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false
+  if ("code" in error && error.code === "23505") return true
+  if ("message" in error && typeof error.message === "string") {
+    return /duplicate key value|unique constraint/i.test(error.message)
+  }
+  return false
+}
+
+/**
+ * Publishes the current draft as the next immutable version.
+ *
+ * The version row, its snapshot fields, and the form pointer are written in one
+ * transaction under a form-row lock, so concurrent publishes serialise instead
+ * of racing on `version_number`; the retry covers any writer that bypasses the
+ * lock. A failure anywhere leaves no version row and no published pointer.
+ */
 export async function publishForm(
   db: AppDb,
   orgId: string,
   userId: string,
   formId: string,
 ): Promise<PublishFormResult> {
-  const form = await requireForm(db, orgId, formId)
-  const draft = await draftRows(db, orgId, formId)
-  if (!draft.length) {
-    throw new AppError(
-      "VALIDATION_ERROR",
-      "Add at least one question before publishing.",
-    )
+  for (let attempt = 1; attempt <= MAX_PUBLISH_ATTEMPTS; attempt += 1) {
+    try {
+      return await db.transaction(async (rawTx) => {
+        const tx = rawTx as unknown as AppDb
+        const form = await lockForm(tx, orgId, formId)
+        const draft = await draftRows(tx, orgId, formId)
+        if (!draft.length) {
+          throw new AppError(
+            "VALIDATION_ERROR",
+            "Add at least one question before publishing.",
+          )
+        }
+
+        const fieldRows = await tableFieldRows(tx, orgId, form.tableId)
+        const fieldsById = new Map(fieldRows.map((row) => [row.id, row]))
+
+        const snapshot = draft.map((row) => {
+          const field = fieldsById.get(row.targetFieldId)
+          if (!field) {
+            throw new AppError(
+              "VALIDATION_ERROR",
+              `“${row.label}” points to a column that was removed from this table.`,
+            )
+          }
+          if (isReadOnlyFieldType(field.type as FieldType)) {
+            throw new AppError(
+              "VALIDATION_ERROR",
+              `“${row.label}” is a read-only column and cannot accept answers.`,
+            )
+          }
+          return { row, field }
+        })
+
+        const latest = await tx
+          .select({ versionNumber: formVersions.versionNumber })
+          .from(formVersions)
+          .where(
+            and(eq(formVersions.orgId, orgId), eq(formVersions.formId, formId)),
+          )
+          .orderBy(desc(formVersions.versionNumber))
+          .limit(1)
+        const versionNumber = (latest[0]?.versionNumber ?? 0) + 1
+        const versionId = `fver_${nanoid(10)}`
+
+        const theme = normalizeFormTheme(form.theme)
+        const thankYou = normalizeFormThankYou(form.thankYou)
+        const settings = normalizeFormSettings(form.settings)
+
+        const [versionRow] = await tx
+          .insert(formVersions)
+          .values({
+            id: versionId,
+            orgId,
+            formId,
+            versionNumber,
+            title: form.name,
+            description: form.description,
+            settings: { ...settings },
+            theme: { ...theme },
+            thankYou: { ...thankYou },
+            publishedBy: userId,
+          })
+          .returning({ publishedAt: formVersions.publishedAt })
+
+        const versionFieldIds = snapshot.map(() => `fvf_${nanoid(10)}`)
+        const draftIdToVersionId = new Map(
+          snapshot.map(({ row }, index) => [row.id, versionFieldIds[index]]),
+        )
+        const draftIds = new Set(draft.map((row) => row.id))
+
+        await tx.insert(formVersionFields).values(
+          snapshot.map(({ row, field }, index) => {
+            const rule = visibilityRule(row.visibilityRule, row.id, draftIds)
+            return {
+              id: versionFieldIds[index],
+              orgId,
+              formVersionId: versionId,
+              targetFieldId: row.targetFieldId,
+              targetFieldType: field.type,
+              label: row.label,
+              helpText: row.helpText,
+              placeholder: row.placeholder,
+              required: row.required,
+              hidden: row.mode === "hidden",
+              rank: row.rank,
+              mode: row.mode === "hidden" ? "hidden" : "visible",
+              fieldConfig: { ...((field.config ?? {}) as Record<string, unknown>) },
+              visibilityRule: rule
+                ? ({
+                    conjunction: rule.conjunction,
+                    conditions: rule.conditions.map((condition) => {
+                      const sourceQuestionId =
+                        draftIdToVersionId.get(condition.sourceQuestionId) ??
+                        condition.sourceQuestionId
+                      return {
+                        ...condition,
+                        sourceQuestionId,
+                        sourceFieldId: sourceQuestionId,
+                      }
+                    }),
+                  } as unknown as Record<string, unknown>)
+                : null,
+            }
+          }),
+        )
+
+        const [updated] = await tx
+          .update(forms)
+          .set({
+            publishedVersionId: versionId,
+            status: "published",
+            updatedAt: new Date(),
+          })
+          .where(
+            and(
+              eq(forms.orgId, orgId),
+              eq(forms.id, formId),
+              isNull(forms.archivedAt),
+            ),
+          )
+          .returning()
+        if (!updated) throw new AppError("NOT_FOUND", "Form not found.")
+
+        return {
+          form: toFormDto(updated),
+          version: {
+            id: versionId,
+            versionNumber,
+            title: form.name,
+            description: form.description,
+            publishedAt: iso(versionRow.publishedAt),
+          },
+          publicUrl: `/f/${form.slug}`,
+        }
+      })
+    } catch (error) {
+      if (attempt < MAX_PUBLISH_ATTEMPTS && isUniqueViolation(error)) continue
+      throw error
+    }
   }
 
-  const fieldRows = await tableFieldRows(db, orgId, form.tableId)
-  const fieldsById = new Map(fieldRows.map((row) => [row.id, row]))
-
-  const snapshot = draft.map((row) => {
-    const field = fieldsById.get(row.targetFieldId)
-    if (!field) {
-      throw new AppError(
-        "VALIDATION_ERROR",
-        `“${row.label}” points to a column that was removed from this table.`,
-      )
-    }
-    if (isReadOnlyFieldType(field.type as FieldType)) {
-      throw new AppError(
-        "VALIDATION_ERROR",
-        `“${row.label}” is a read-only column and cannot accept answers.`,
-      )
-    }
-    return { row, field }
-  })
-
-  const latest = await db
-    .select({ versionNumber: formVersions.versionNumber })
-    .from(formVersions)
-    .where(and(eq(formVersions.orgId, orgId), eq(formVersions.formId, formId)))
-    .orderBy(desc(formVersions.versionNumber))
-    .limit(1)
-  const versionNumber = (latest[0]?.versionNumber ?? 0) + 1
-  const versionId = `fver_${nanoid(10)}`
-
-  const theme = normalizeFormTheme(form.theme)
-  const thankYou = normalizeFormThankYou(form.thankYou)
-  const settings = normalizeFormSettings(form.settings)
-
-  await db.insert(formVersions).values({
-    id: versionId,
-    orgId,
-    formId,
-    versionNumber,
-    title: form.name,
-    description: form.description,
-    settings: { ...settings },
-    theme: { ...theme },
-    thankYou: { ...thankYou },
-    publishedBy: userId,
-  })
-
-  const versionFieldIds = snapshot.map(() => `fvf_${nanoid(10)}`)
-  const draftIdToVersionId = new Map(
-    snapshot.map(({ row }, index) => [row.id, versionFieldIds[index]]),
+  throw new AppError(
+    "REVISION_CONFLICT",
+    "This form was published by someone else. Refresh and try again.",
   )
-  const draftIds = new Set(draft.map((row) => row.id))
-
-  await db.insert(formVersionFields).values(
-    snapshot.map(({ row, field }, index) => {
-      const rule = visibilityRule(row.visibilityRule, row.id, draftIds)
-      return {
-        id: versionFieldIds[index],
-        orgId,
-        formVersionId: versionId,
-        targetFieldId: row.targetFieldId,
-        targetFieldType: field.type,
-        label: row.label,
-        helpText: row.helpText,
-        placeholder: row.placeholder,
-        required: row.required,
-        hidden: row.mode === "hidden",
-        rank: row.rank,
-        mode: row.mode === "hidden" ? "hidden" : "visible",
-        fieldConfig: { ...((field.config ?? {}) as Record<string, unknown>) },
-        visibilityRule: rule
-          ? ({
-              conjunction: rule.conjunction,
-              conditions: rule.conditions.map((condition) => {
-                const sourceQuestionId =
-                  draftIdToVersionId.get(condition.sourceQuestionId) ??
-                  condition.sourceQuestionId
-                return {
-                  ...condition,
-                  sourceQuestionId,
-                  sourceFieldId: sourceQuestionId,
-                }
-              }),
-            } as unknown as Record<string, unknown>)
-          : null,
-      }
-    }),
-  )
-
-
-  await db
-    .update(forms)
-    .set({
-      publishedVersionId: versionId,
-      status: "published",
-      updatedAt: new Date(),
-    })
-    .where(and(eq(forms.orgId, orgId), eq(forms.id, formId)))
-
-  const updated = await requireForm(db, orgId, formId)
-  const publishedAt = new Date().toISOString()
-  return {
-    form: toFormDto(updated),
-    version: {
-      id: versionId,
-      versionNumber,
-      title: form.name,
-      description: form.description,
-      publishedAt,
-    },
-    publicUrl: `/f/${form.slug}`,
-  }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1749,12 +1846,16 @@ export async function getFormAnalytics(
     totals.submissions += point.submissions
   }
 
+  // Completion is measured against people who started the form; views are the
+  // fallback for older forms that never recorded a start event.
+  const started = totals.starts > 0 ? totals.starts : totals.views
   return {
     form: { id: form.id, name: form.name, slug: form.slug },
     fromDay: range.fromDay,
     toDay: range.toDay,
     totals,
-    completionRate: totals.views > 0 ? totals.submissions / totals.views : 0,
+    completionRate:
+      started > 0 ? Math.min(1, totals.submissions / started) : 0,
     series,
   }
 }
@@ -1780,39 +1881,30 @@ async function incrementBucket(
   breakdownKind = "total",
   breakdownKey = "all",
 ): Promise<void> {
-  const existing = await db
-    .select({ id: formMetricBuckets.id })
-    .from(formMetricBuckets)
-    .where(
-      and(
-        eq(formMetricBuckets.orgId, orgId),
-        eq(formMetricBuckets.formId, formId),
-        eq(formMetricBuckets.day, day),
-        eq(formMetricBuckets.metric, metric),
-        eq(formMetricBuckets.breakdownKind, breakdownKind),
-        eq(formMetricBuckets.breakdownKey, breakdownKey),
-      ),
-    )
-    .limit(1)
-
-  if (existing[0]) {
-    await db
-      .update(formMetricBuckets)
-      .set({ count: sql`${formMetricBuckets.count} + 1` })
-      .where(eq(formMetricBuckets.id, existing[0].id))
-    return
-  }
-
-  await db.insert(formMetricBuckets).values({
-    id: `fmb_${nanoid(10)}`,
-    orgId,
-    formId,
-    day,
-    metric,
-    breakdownKind,
-    breakdownKey,
-    count: 1,
-  })
+  // One statement: concurrent increments either create the bucket or add to it,
+  // never both (the read-then-write version lost updates under contention).
+  await db
+    .insert(formMetricBuckets)
+    .values({
+      id: `fmb_${nanoid(10)}`,
+      orgId,
+      formId,
+      day,
+      metric,
+      breakdownKind,
+      breakdownKey,
+      count: 1,
+    })
+    .onConflictDoUpdate({
+      target: [
+        formMetricBuckets.formId,
+        formMetricBuckets.day,
+        formMetricBuckets.metric,
+        formMetricBuckets.breakdownKind,
+        formMetricBuckets.breakdownKey,
+      ],
+      set: { count: sql`${formMetricBuckets.count} + 1` },
+    })
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1833,6 +1925,9 @@ async function formBySlug(
 }
 
 function assertPublished(form: typeof forms.$inferSelect): void {
+  if (form.archivedAt) {
+    throw new AppError("NOT_FOUND", "Form not found.")
+  }
   if (form.status === "closed") {
     throw new AppError("FORM_CLOSED", "This form is closed.")
   }
@@ -2035,126 +2130,287 @@ async function allocateAutoNumbers(
   return values
 }
 
+/** Respondent facts the transport knows and the service needs. */
+export interface PublicSubmissionContext {
+  /** `Idempotency-Key` header, when the caller sends one. */
+  idempotencyKey?: string
+  ip?: string
+  userAgent?: string
+}
+
+const ANONYMOUS_RESPONDENT = "anonymous"
+
+/**
+ * Stable per-person key. IP plus user agent is weak evidence, but it is all a
+ * public form has; forms that allow one response per person rely on it.
+ */
+function respondentKeyFor(
+  formId: string,
+  context: PublicSubmissionContext,
+): string {
+  const ip = context.ip?.trim() ?? ""
+  const userAgent = context.userAgent?.trim() ?? ""
+  if (!ip && !userAgent) return ANONYMOUS_RESPONDENT
+  return createHash("sha256")
+    .update(`${formId}\u0000${ip}\u0000${userAgent}`)
+    .digest("hex")
+}
+
+function submissionKeyFor(
+  body: Record<string, unknown>,
+  context: PublicSubmissionContext,
+): string | undefined {
+  for (const candidate of [context.idempotencyKey, body.submissionKey]) {
+    if (candidate === undefined) continue
+    if (typeof candidate !== "string") {
+      throw new AppError("VALIDATION_ERROR", "submissionKey must be a string.")
+    }
+    const trimmed = candidate.trim()
+    if (!trimmed) continue
+    if (trimmed.length > 200) {
+      throw new AppError(
+        "VALIDATION_ERROR",
+        "submissionKey must be 200 characters or fewer.",
+      )
+    }
+    return trimmed
+  }
+  return undefined
+}
+
+async function lockFormBySlug(
+  db: AppDb,
+  slug: string,
+): Promise<typeof forms.$inferSelect> {
+  const rows = await db
+    .select()
+    .from(forms)
+    .where(eq(forms.slug, slug))
+    .for("update")
+  if (!rows[0]) throw new AppError("NOT_FOUND", "Form not found.")
+  return rows[0]
+}
+
+type SubmissionKeyKind = "idempotencyKey" | "respondentKey"
+
+async function findSubmissionByKey(
+  db: AppDb,
+  orgId: string,
+  formId: string,
+  kind: SubmissionKeyKind,
+  value: string,
+): Promise<{ id: string; recordId: string | null } | undefined> {
+  const rows = await db
+    .select({ id: formSubmissions.id, recordId: formSubmissions.recordId })
+    .from(formSubmissions)
+    .where(
+      and(
+        eq(formSubmissions.orgId, orgId),
+        eq(formSubmissions.formId, formId),
+        sql`${formSubmissions.metadata} ->> ${kind} = ${value}`,
+      ),
+    )
+    .limit(1)
+  return rows[0]
+}
+
+/**
+ * Stores one public response and its linked record atomically.
+ *
+ * Everything runs in a single transaction under a form-row lock: idempotency
+ * and duplicate-respondent checks, auto-number allocation, the record insert,
+ * the submission row, and the analytics bucket. A failure at any point rolls
+ * all of it back, so a rejected submission never burns a sequence number or
+ * leaves an orphan record behind.
+ */
 export async function submitPublicForm(
   db: AppDb,
   slug: string,
   input: unknown,
+  context: PublicSubmissionContext = {},
 ): Promise<PublicSubmissionResult> {
   const body = inputObject(input, "submission")
-  const form = await formBySlug(db, slug)
-  assertPublished(form)
+  const requestedKey = submissionKeyFor(body, context)
 
-  const versionRows = await db
-    .select()
-    .from(formVersions)
-    .where(
-      and(
-        eq(formVersions.orgId, form.orgId),
-        eq(formVersions.id, form.publishedVersionId!),
-      ),
-    )
-    .limit(1)
-  const version = versionRows[0]
-  if (!version) throw new AppError("NOT_FOUND", "Form not found.")
+  return db.transaction(async (rawTx) => {
+    const tx = rawTx as unknown as AppDb
+    const form = await lockFormBySlug(tx, slug)
+    assertPublished(form)
 
-  const versionFields = await publishedVersionFields(db, form.orgId, version.id)
-  if (!versionFields.length) throw new AppError("NOT_FOUND", "Form not found.")
-
-  const questions = publicQuestions(versionFields)
-  const questionsById = new Map(questions.map((question) => [question.id, question]))
-  const questionByTarget = new Map(
-    versionFields.map((row) => [row.targetFieldId, row.id]),
-  )
-
-  const submitted = normalizeAnswers(body.answers)
-  const answers = new Map<string, unknown>()
-  for (const [key, value] of submitted) {
-    const questionId = questionsById.has(key)
-      ? key
-      : questionByTarget.get(key)
-    if (!questionId) {
-      throw new AppError(
-        "FORM_UPDATED",
-        "This form changed while you were submitting. Refresh and send your response again.",
+    const versionRows = await tx
+      .select()
+      .from(formVersions)
+      .where(
+        and(
+          eq(formVersions.orgId, form.orgId),
+          eq(formVersions.id, form.publishedVersionId!),
+        ),
       )
+      .limit(1)
+    const version = versionRows[0]
+    if (!version) throw new AppError("NOT_FOUND", "Form not found.")
+
+    const thankYou = normalizeFormThankYou(version.thankYou ?? form.thankYou)
+    const settings = normalizeFormSettings(version.settings ?? form.settings)
+    const respondentKey = respondentKeyFor(form.id, context)
+
+    // A retry with the same key is the same submission, whatever changed since.
+    if (requestedKey) {
+      const existing = await findSubmissionByKey(
+        tx,
+        form.orgId,
+        form.id,
+        "idempotencyKey",
+        requestedKey,
+      )
+      if (existing) {
+        return {
+          submissionId: existing.id,
+          recordId: existing.recordId ?? "",
+          thankYou,
+        }
+      }
     }
-    answers.set(questionId, value)
-  }
 
-  const visible = new Set(
-    visibleFormQuestions(
-      questions,
-      answers as ReadonlyMap<string, FormAnswerValue>,
-    ).map((question) => question.id),
-  )
-
-  const submittedValues: Record<string, unknown> = {}
-  const snapshotFields: FieldDefinition[] = versionFields.map((row) => ({
-    id: row.targetFieldId,
-    name: row.label,
-    type: row.targetFieldType as FieldType,
-    config: (row.fieldConfig ?? {}) as FieldConfig,
-    rank: row.rank,
-    width: 180,
-    isPrimary: false,
-  }))
-
-  for (const row of versionFields) {
-    if (!visible.has(row.id) || row.mode === "hidden") continue
-    const raw = answers.get(row.id)
-    if (isBlankAnswer(raw)) {
-      if (row.required) {
-        throw new AppError(
-          "VALIDATION_ERROR",
-          `“${row.label}” is required.`,
+    if (!settings.allowMultipleSubmissions) {
+      const existing = await findSubmissionByKey(
+        tx,
+        form.orgId,
+        form.id,
+        "respondentKey",
+        respondentKey,
+      )
+      if (existing) {
+        throw new HttpStatusError(
+          "DUPLICATE_SUBMISSION",
+          "You have already submitted this form.",
+          409,
+          { submissionId: existing.id },
         )
       }
-      continue
     }
-    submittedValues[row.targetFieldId] = raw
-  }
 
-  const recordValues: Record<string, unknown> = validateRecordValues(
-    submittedValues,
-    snapshotFields,
-  )
-
-  const autoNumbers = await allocateAutoNumbers(db, form.orgId, form.tableId)
-  Object.assign(recordValues, autoNumbers)
-
-  const tableFields = await tableFieldRows(db, form.orgId, form.tableId)
-  const searchText = buildRecordSearchText(
-    recordValues,
-    tableFields.map(toFieldDefinition),
-  )
-
-  const lastRecord = await db
-    .select({ rank: records.rank })
-    .from(records)
-    .where(
-      and(eq(records.orgId, form.orgId), eq(records.tableId, form.tableId)),
+    const versionFields = await publishedVersionFields(
+      tx,
+      form.orgId,
+      version.id,
     )
-    .orderBy(desc(records.rank))
-    .limit(1)
-  const rank = generateKeyBetween(lastRecord[0]?.rank ?? null, null)
+    if (!versionFields.length) throw new AppError("NOT_FOUND", "Form not found.")
 
-  const recordId = `rec_${nanoid(12)}`
-  await db.insert(records).values({
-    id: recordId,
-    orgId: form.orgId,
-    tableId: form.tableId,
-    rank,
-    values: recordValues,
-    searchText,
-    revision: 1,
-    status: "active",
-    createdBy: PUBLIC_ACTOR,
-    updatedBy: PUBLIC_ACTOR,
-  })
+    const questions = publicQuestions(versionFields)
+    const questionsById = new Map(
+      questions.map((question) => [question.id, question]),
+    )
+    const questionByTarget = new Map(
+      versionFields.map((row) => [row.targetFieldId, row.id]),
+    )
 
-  const submissionId = `sub_${nanoid(12)}`
-  try {
-    await db.insert(formSubmissions).values({
+    const submitted = normalizeAnswers(body.answers)
+    const answers = new Map<string, unknown>()
+    for (const [key, value] of submitted) {
+      const questionId = questionsById.has(key)
+        ? key
+        : questionByTarget.get(key)
+      if (!questionId) {
+        throw new AppError(
+          "FORM_UPDATED",
+          "This form changed while you were submitting. Refresh and send your response again.",
+          { questions: [{ id: key, label: null }] },
+        )
+      }
+      answers.set(questionId, value)
+    }
+
+    const visible = new Set(
+      visibleFormQuestions(
+        questions,
+        answers as ReadonlyMap<string, FormAnswerValue>,
+      ).map((question) => question.id),
+    )
+
+    const submittedValues: Record<string, unknown> = {}
+    const snapshotFields: FieldDefinition[] = versionFields.map((row) => ({
+      id: row.targetFieldId,
+      name: row.label,
+      type: row.targetFieldType as FieldType,
+      config: (row.fieldConfig ?? {}) as FieldConfig,
+      rank: row.rank,
+      width: 180,
+      isPrimary: false,
+    }))
+
+    for (const row of versionFields) {
+      if (!visible.has(row.id) || row.mode === "hidden") continue
+      const raw = answers.get(row.id)
+      if (isBlankAnswer(raw)) {
+        if (row.required) {
+          throw new AppError("VALIDATION_ERROR", `“${row.label}” is required.`)
+        }
+        continue
+      }
+      submittedValues[row.targetFieldId] = raw
+    }
+
+    // Columns archived after publishing are refused instead of silently
+    // storing values in a field nobody can see any more.
+    const tableFields = await tableFieldRows(tx, form.orgId, form.tableId)
+    const activeFieldIds = new Set(tableFields.map((row) => row.id))
+    const changedQuestions = versionFields
+      .filter(
+        (row) =>
+          row.targetFieldId in submittedValues &&
+          !activeFieldIds.has(row.targetFieldId),
+      )
+      .map((row) => ({ id: row.id, label: row.label }))
+    if (changedQuestions.length) {
+      throw new AppError(
+        "FORM_UPDATED",
+        `This form changed while you were submitting: ${changedQuestions
+          .map((question) => `“${question.label}”`)
+          .join(", ")} no longer accepts answers. Refresh and send your response again.`,
+        { questions: changedQuestions },
+      )
+    }
+
+    const recordValues: Record<string, unknown> = validateRecordValues(
+      submittedValues,
+      snapshotFields,
+    )
+
+    const autoNumbers = await allocateAutoNumbers(tx, form.orgId, form.tableId)
+    Object.assign(recordValues, autoNumbers)
+
+    const searchText = buildRecordSearchText(
+      recordValues,
+      tableFields.map(toFieldDefinition),
+    )
+
+    const lastRecord = await tx
+      .select({ rank: records.rank })
+      .from(records)
+      .where(
+        and(eq(records.orgId, form.orgId), eq(records.tableId, form.tableId)),
+      )
+      .orderBy(desc(records.rank))
+      .limit(1)
+    const rank = generateKeyBetween(lastRecord[0]?.rank ?? null, null)
+
+    const recordId = `rec_${nanoid(12)}`
+    await tx.insert(records).values({
+      id: recordId,
+      orgId: form.orgId,
+      tableId: form.tableId,
+      rank,
+      values: recordValues,
+      searchText,
+      revision: 1,
+      status: "active",
+      createdBy: PUBLIC_ACTOR,
+      updatedBy: PUBLIC_ACTOR,
+    })
+
+    const submissionId = `sub_${nanoid(12)}`
+    await tx.insert(formSubmissions).values({
       id: submissionId,
       orgId: form.orgId,
       formId: form.id,
@@ -2164,30 +2420,21 @@ export async function submitPublicForm(
       metadata: {
         source: "public-form",
         slug: form.slug,
+        respondentKey,
+        ...(requestedKey ? { idempotencyKey: requestedKey } : {}),
       },
     })
-  } catch (error) {
-    await db.delete(records).where(eq(records.id, recordId)).catch(() => undefined)
-    throw error
-  }
 
-  try {
     await incrementBucket(
-      db,
+      tx,
       form.orgId,
       form.id,
       safeDay(timeZone(form.analyticsTimeZone)),
       "submission",
     )
-  } catch {
-    // Analytics must never discard a response that was already stored.
-  }
 
-  return {
-    submissionId,
-    recordId,
-    thankYou: normalizeFormThankYou(version.thankYou ?? form.thankYou),
-  }
+    return { submissionId, recordId, thankYou }
+  })
 }
 
 export async function recordPublicFormMetric(

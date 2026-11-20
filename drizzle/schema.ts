@@ -258,6 +258,7 @@ export const forms = pgTable(
     createdBy: text("created_by").notNull(),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+    archivedAt: timestamp("archived_at", { withTimezone: true }),
   },
   (table) => [
     index("forms_base_status_idx").on(table.baseId, table.status),
@@ -308,7 +309,7 @@ export const formVersions = pgTable(
     publishedAt: timestamp("published_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
-    index("form_versions_form_idx").on(table.formId, table.versionNumber),
+    uniqueIndex("form_versions_form_version_idx").on(table.formId, table.versionNumber),
   ],
 )
 
@@ -374,6 +375,40 @@ export const formMetricBuckets = pgTable(
   },
   (table) => [
     index("form_metric_buckets_form_day_idx").on(table.formId, table.day),
+    uniqueIndex("form_metric_buckets_identity_idx").on(
+      table.formId,
+      table.day,
+      table.metric,
+      table.breakdownKind,
+      table.breakdownKey,
+    ),
+  ],
+)
+
+/**
+ * Server-issued, single-use approval tickets for AI write operations. The
+ * client only ever echoes `id`; the server binds it to the session, operation,
+ * and input hash, and consumes it atomically so replays fail.
+ */
+export const aiWriteProposals = pgTable(
+  "ai_write_proposals",
+  {
+    id: text("id").primaryKey(),
+    orgId: text("org_id").notNull(),
+    userId: text("user_id").notNull(),
+    operation: text("operation").notNull(),
+    inputHash: text("input_hash").notNull(),
+    input: jsonb("input").$type<Record<string, unknown>>().notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    consumedAt: timestamp("consumed_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index("ai_write_proposals_user_expiry_idx").on(
+      table.orgId,
+      table.userId,
+      table.expiresAt,
+    ),
   ],
 )
 

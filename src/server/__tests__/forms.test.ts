@@ -512,7 +512,8 @@ describe("Forms backend", () => {
     expect(analytics.totals.starts).toBe(1)
     expect(analytics.series).toHaveLength(7)
     expect(analytics.series.reduce((sum, point) => sum + point.submissions, 0)).toBe(1)
-    expect(analytics.completionRate).toBe(0)
+    // One start and one submission: completion is submissions / starts.
+    expect(analytics.completionRate).toBe(1)
 
     const closeResponse = await formDetailPATCH(
       jsonRequest(`/api/forms/${formId}`, "PATCH", { status: "closed" }),
