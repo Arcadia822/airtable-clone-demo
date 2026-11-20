@@ -3,6 +3,7 @@ import { eq } from "drizzle-orm"
 
 import {
   aiReports,
+  aiWriteProposals,
   bases,
   fields,
   fieldSequences,
@@ -32,6 +33,7 @@ import {
 import {
   buildWriteProposal,
   describeTable,
+  issueWriteProposalToken,
   type AiToolContext,
   type SummarizeTableOutput,
 } from "@/server/ai/tools"
@@ -336,10 +338,12 @@ describe("Factory managed AI", () => {
       await db.select().from(fields).where(eq(fields.orgId, session.orgId)),
     ).toHaveLength(fieldsBefore.length)
 
+    const token = await issueWriteProposalToken(ctx, proposal)
     const response = await writeToolPOST(
       jsonRequest("/api/ai/tools/write", {
         input: proposal.input,
         operation: proposal.operation,
+        token,
       }),
     )
     expect(response.status).toBe(200)
@@ -447,10 +451,12 @@ describe("Factory managed AI", () => {
     })
     expect(proposal.diff.some((row) => row.after === "Renamed launch")).toBe(true)
 
+    const token = await issueWriteProposalToken(ctx, proposal)
     const response = await writeToolPOST(
       jsonRequest("/api/ai/tools/write", {
         input: proposal.input,
         operation: proposal.operation,
+        token,
       }),
     )
     expect(response.status).toBe(200)
@@ -465,10 +471,17 @@ describe("Factory managed AI", () => {
     expect(updated.revision).toBe(record.revision + 1)
     expect(updated.searchText).toContain("renamed launch")
 
+    // A freshly approved proposal for the same stale input must pass the token
+    // check and fail on the revision guard, which is the point of this test.
+    const staleInput = { ...proposal.input, expectedVersion: record.revision }
     const stale = await writeToolPOST(
       jsonRequest("/api/ai/tools/write", {
-        input: { ...proposal.input, expectedVersion: record.revision },
+        input: staleInput,
         operation: "update_record",
+        token: await issueWriteProposalToken(ctx, {
+          ...proposal,
+          input: staleInput,
+        }),
       }),
     )
     expect(stale.status).toBe(409)
@@ -685,6 +698,7 @@ describe("Factory managed AI", () => {
     expect(proposalEvent.proposal.operation).toBe("create_table")
     expect(proposalEvent.proposal.requiresApproval).toBe(true)
     expect(proposalEvent.proposal.diff.length).toBeGreaterThan(0)
+    expect(proposalEvent.proposal.token).toMatch(/^awp_/)
 
     const tablesAfter = await db
       .select()
@@ -813,6 +827,59 @@ describe("Factory managed AI", () => {
     await expect(
       describeTable(ctx, { baseId: "base_other_org", tableId: seeded.tableId }),
     ).rejects.toBeInstanceOf(AppError)
+  })
+
+  it("prunes expired write proposals when issuing a new one", async () => {
+    const db = await getDb()
+    const ctx: AiToolContext = { db, session }
+    const now = Date.now()
+
+    await db.insert(aiWriteProposals).values([
+      {
+        expiresAt: new Date(now - 60_000),
+        id: "awp_expired",
+        input: {},
+        inputHash: "expired",
+        operation: "create_record",
+        orgId: session.orgId,
+        userId: session.userId,
+      },
+      {
+        expiresAt: new Date(now - 30_000),
+        id: "awp_expired_too",
+        input: {},
+        inputHash: "expired-too",
+        operation: "create_record",
+        orgId: session.orgId,
+        userId: session.userId,
+      },
+      {
+        expiresAt: new Date(now + 600_000),
+        id: "awp_live",
+        input: {},
+        inputHash: "live",
+        operation: "create_record",
+        orgId: session.orgId,
+        userId: session.userId,
+      },
+    ])
+
+    const token = await issueWriteProposalToken(ctx, {
+      diff: [],
+      input: { answers: {} },
+      operation: "create_record",
+      requiresApproval: true,
+      summary: "Prune check",
+      title: "Prune check",
+      warnings: [],
+    })
+
+    const rows = await db.select().from(aiWriteProposals)
+    const ids = rows.map((row) => row.id)
+    expect(ids).toContain(token)
+    expect(ids).toContain("awp_live")
+    expect(ids).not.toContain("awp_expired")
+    expect(ids).not.toContain("awp_expired_too")
   })
 })
 

@@ -1,4 +1,18 @@
-import { and, asc, count, desc, eq, gte, inArray, ilike } from "drizzle-orm"
+import { createHash } from "node:crypto"
+
+import {
+  and,
+  asc,
+  count,
+  desc,
+  eq,
+  gt,
+  gte,
+  inArray,
+  isNull,
+  lt,
+  sql,
+} from "drizzle-orm"
 import {
   generateKeyBetween,
   generateNKeysBetween,
@@ -7,6 +21,7 @@ import { nanoid } from "nanoid"
 import { z } from "zod"
 
 import {
+  aiWriteProposals,
   bases,
   fields,
   fieldSequences,
@@ -70,6 +85,9 @@ import {
   writeOperationSchema,
 } from "@/lib/eve/contracts"
 import type { AuthenticatedSession } from "@/server/auth"
+import { HttpStatusError } from "@/server/http"
+import { rebuildTableSearchText } from "@/server/services/fields"
+import { allocateSequenceValues } from "@/server/services/tables"
 import { buildRecordSearchText } from "@/server/search-text"
 
 export type ReadOperation = z.infer<typeof readOperationSchema>
@@ -83,7 +101,6 @@ export interface AiToolContext {
 }
 
 const MAX_SUMMARY_RECORDS = 5_000
-const MAX_LIST_SCAN = 1_000
 const MAX_TOP_VALUES = 20
 
 const NUMERIC_FIELD_TYPES: ReadonlySet<FieldType> = new Set([
@@ -210,8 +227,13 @@ export async function listRecords(
     eq(records.tableId, table.id),
     eq(records.status, "active"),
   ]
-  if (input.search) {
-    where.push(ilike(records.searchText, likePattern(input.search)))
+  // Same term-AND semantics as `queryRecords`: every word must appear.
+  const searchTerms = (input.search ?? "")
+    .toLowerCase()
+    .split(/\s+/)
+    .filter(Boolean)
+  for (const term of searchTerms) {
+    where.push(sql`${records.searchText} ilike ${likePattern(term)} escape '\\'`)
   }
 
   const sortField = input.sort
@@ -221,35 +243,26 @@ export async function listRecords(
     throw new AppError("NOT_FOUND", "That column is no longer available.")
   }
 
-  let scanned: Array<typeof records.$inferSelect>
-  let hasMore: boolean
-  if (sortField) {
-    const rows = await ctx.db
-      .select()
-      .from(records)
-      .where(and(...where))
-      .orderBy(asc(records.rank))
-      .limit(MAX_LIST_SCAN)
-    rows.sort((left, right) =>
-      compareCellValues(
-        left.values[sortField.id],
-        right.values[sortField.id],
-        input.sort?.direction === "desc",
-      ),
-    )
-    scanned = rows.slice(offset, offset + input.limit)
-    hasMore = offset + scanned.length < rows.length
-  } else {
-    const rows = await ctx.db
-      .select()
-      .from(records)
-      .where(and(...where))
-      .orderBy(asc(records.rank))
-      .limit(input.limit + 1)
-      .offset(offset)
-    scanned = rows.slice(0, input.limit)
-    hasMore = rows.length > input.limit
-  }
+  // Ordering happens in SQL over the whole table: sorting a capped in-memory
+  // window paginated rows inconsistently and dropped matches beyond the cap.
+  const orderBy = sortField
+    ? [
+        input.sort?.direction === "desc"
+          ? sql`${sortExpression(sortField)} desc nulls last`
+          : sql`${sortExpression(sortField)} asc nulls last`,
+        asc(records.rank),
+      ]
+    : [asc(records.rank)]
+
+  const rows = await ctx.db
+    .select()
+    .from(records)
+    .where(and(...where))
+    .orderBy(...orderBy)
+    .limit(input.limit + 1)
+    .offset(offset)
+  const scanned = rows.slice(0, input.limit)
+  const hasMore = rows.length > input.limit
 
   const projectedFields = input.fieldIds
     ? fieldDefinitions.filter((field) => input.fieldIds?.includes(field.id))
@@ -282,7 +295,7 @@ export async function listRecords(
   })
 
   const nextCursor = hasMore ? String(offset + scanned.length) : null
-  const truncated = Boolean(nextCursor) || scanned.length >= MAX_LIST_SCAN
+  const truncated = Boolean(nextCursor)
 
   return {
     records: snapshots,
@@ -544,7 +557,8 @@ export async function formAnalytics(
 
   const views = series.reduce((total, row) => total + row.views, 0)
   const starts = series.reduce((total, row) => total + row.starts, 0)
-  const denominator = views > 0 ? views : starts
+  // Same definition as the analytics service: starts first, views as fallback.
+  const denominator = starts > 0 ? starts : views
 
   return {
     range: { from: range.fromDay, to: range.toDay, timezone },
@@ -705,6 +719,174 @@ export async function executeApprovedWrite(
     case "create_view":
       return executeCreateView(ctx, parsed.input)
   }
+}
+
+/* ---- approval tokens ----------------------------------------------------- */
+
+/**
+ * How long an approval stays valid. Short on purpose: a proposal is meant to be
+ * reviewed and applied in one sitting, not replayed hours later.
+ */
+const WRITE_PROPOSAL_TTL_MS = 15 * 60 * 1000
+
+/** JSON with sorted keys, so an input hash ignores object key order. */
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value) ?? "null"
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalJson).join(",")}]`
+  }
+  const entries = Object.entries(value as Record<string, unknown>)
+    .filter(([, item]) => item !== undefined)
+    .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+  return `{${entries
+    .map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`)
+    .join(",")}}`
+}
+
+function writeInputHash(operation: WriteOperation, input: unknown): string {
+  return createHash("sha256")
+    .update(`${operation}\u0000${canonicalJson(input)}`)
+    .digest("hex")
+}
+
+/** How many expired proposals one opportunistic prune may remove. */
+const EXPIRED_PROPOSAL_PRUNE_BATCH = 50
+
+/**
+ * Deletes one bounded batch of expired proposals.
+ *
+ * Expired rows are dead weight the moment their TTL passes: they can no longer
+ * be consumed, and nothing reads them but the failure path. They are pruned
+ * here, when a new proposal is issued, so no scheduler is needed. Best effort
+ * by design: pruning is housekeeping, so a failure must never stop the
+ * assistant from proposing a write, and the batch keeps the statement cheap on
+ * the chat path even after a long idle period.
+ */
+async function pruneExpiredWriteProposals(db: AppDb): Promise<void> {
+  try {
+    await db.delete(aiWriteProposals).where(
+      inArray(
+        aiWriteProposals.id,
+        db
+          .select({ id: aiWriteProposals.id })
+          .from(aiWriteProposals)
+          .where(lt(aiWriteProposals.expiresAt, new Date()))
+          .limit(EXPIRED_PROPOSAL_PRUNE_BATCH),
+      ),
+    )
+  } catch {
+    // Unreachable in the normal case; a stale proposal row is not an error.
+  }
+}
+
+/**
+ * Issues the server-side half of an approval. The token is bound to the
+ * session that requested it, the operation, and a hash of the exact input the
+ * assistant proposed; the client can only echo the opaque id back.
+ */
+export async function issueWriteProposalToken(
+  ctx: AiToolContext,
+  proposal: WriteProposal,
+): Promise<string> {
+  await pruneExpiredWriteProposals(ctx.db)
+  const token = `awp_${nanoid(24)}`
+  await ctx.db.insert(aiWriteProposals).values({
+    id: token,
+    orgId: ctx.session.orgId,
+    userId: ctx.session.userId,
+    operation: proposal.operation,
+    inputHash: writeInputHash(proposal.operation, proposal.input),
+    input: proposal.input,
+    expiresAt: new Date(Date.now() + WRITE_PROPOSAL_TTL_MS),
+  })
+  return token
+}
+
+export interface ApprovedWrite {
+  operation: WriteOperation
+  input: Record<string, JsonValue>
+}
+
+/**
+ * Consumes a proposal token exactly once.
+ *
+ * The `UPDATE … RETURNING` filters on every binding at once, so a token cannot
+ * be reused (replay), cannot be swapped to another operation or input, cannot
+ * cross organisations or users, and cannot outlive its TTL. The stored input is
+ * returned so execution never trusts the client's copy.
+ */
+export async function consumeWriteProposalToken(
+  ctx: AiToolContext,
+  token: string,
+  operation: WriteOperation,
+  input: unknown,
+): Promise<ApprovedWrite> {
+  const now = new Date()
+  const [consumed] = await ctx.db
+    .update(aiWriteProposals)
+    .set({ consumedAt: now })
+    .where(
+      and(
+        eq(aiWriteProposals.id, token),
+        eq(aiWriteProposals.orgId, ctx.session.orgId),
+        eq(aiWriteProposals.userId, ctx.session.userId),
+        eq(aiWriteProposals.operation, operation),
+        eq(aiWriteProposals.inputHash, writeInputHash(operation, input)),
+        isNull(aiWriteProposals.consumedAt),
+        gt(aiWriteProposals.expiresAt, now),
+      ),
+    )
+    .returning({ input: aiWriteProposals.input })
+
+  if (consumed) {
+    // Written from `WriteProposal.input`, which is JSON by construction.
+    const stored = consumed.input as Record<string, JsonValue>
+    return { operation, input: stored }
+  }
+
+  const [existing] = await ctx.db
+    .select({
+      consumedAt: aiWriteProposals.consumedAt,
+      expiresAt: aiWriteProposals.expiresAt,
+    })
+    .from(aiWriteProposals)
+    .where(
+      and(
+        eq(aiWriteProposals.id, token),
+        eq(aiWriteProposals.orgId, ctx.session.orgId),
+        eq(aiWriteProposals.userId, ctx.session.userId),
+      ),
+    )
+    .limit(1)
+
+  if (!existing) {
+    throw new HttpStatusError(
+      "PROPOSAL_INVALID",
+      "This change was not approved by the assistant. Ask it to prepare the change again.",
+      403,
+    )
+  }
+  if (existing.consumedAt) {
+    throw new HttpStatusError(
+      "PROPOSAL_ALREADY_USED",
+      "This approval has already been applied. Ask the assistant to prepare the change again.",
+      409,
+    )
+  }
+  if (existing.expiresAt.getTime() <= now.getTime()) {
+    throw new HttpStatusError(
+      "PROPOSAL_EXPIRED",
+      "This approval expired before it was applied. Ask the assistant to prepare the change again.",
+      409,
+    )
+  }
+  throw new HttpStatusError(
+    "PROPOSAL_INVALID",
+    "This approval does not match the change being applied. Ask the assistant to prepare the change again.",
+    403,
+  )
 }
 
 /* ---- create_table -------------------------------------------------------- */
@@ -970,74 +1152,78 @@ async function executeCreateTable(
 
   const tableId = `tbl_${nanoid(10)}`
   const tableRank = await nextTableRank(ctx, base.id)
-
-  await db.insert(tables).values({
-    id: tableId,
-    orgId,
-    baseId: base.id,
-    name: input.name,
-    description: input.description,
-    rank: tableRank,
-    status: "active",
-  })
-
-  await db.insert(fields).values(
-    plannedFields.map((field) => ({
-      id: field.id,
-      orgId,
-      tableId,
-      name: field.name,
-      type: field.type,
-      config: field.config as unknown as Record<string, unknown>,
-      rank: field.rank,
-      width: field.width,
-      isPrimary: field.isPrimary,
-      frozen: field.isPrimary,
-      status: "active",
-    })),
-  )
-
-  const autoNumberFields = plannedFields.filter(
-    (field) => field.type === "autoNumber",
-  )
-  if (autoNumberFields.length > 0) {
-    await db.insert(fieldSequences).values(
-      autoNumberFields.map((field) => ({
-        fieldId: field.id,
-        tableId,
-        nextValue:
-          (input.sampleRows?.length ?? 0) +
-          1,
-      })),
-    )
-  }
-
   const plannedViews = planTableViews(input.name, plannedFields)
   const viewIds = plannedViews.map(() => `viw_${nanoid(10)}`)
-  await db.insert(views).values(
-    plannedViews.map((view, index) => ({
-      id: viewIds[index],
-      orgId,
-      tableId,
-      name: view.name,
-      type: view.type,
-      isDefault: view.type === "grid",
-      rank: `a${index}`,
-      configuration: view.configuration,
-      status: "active",
-    })),
-  )
-
   const fieldDefinitions = plannedFields.map(toPlannedFieldDefinition)
+
+  // Validate every sample row before opening the transaction: a bad cell must
+  // leave no table, no columns, no sequences, and no views behind.
   const recordsToInsert = buildTableRecords({
     ctx,
     fieldDefinitions,
     rows: input.sampleRows ?? [],
     tableId,
   })
-  if (recordsToInsert.length > 0) {
-    await db.insert(records).values(recordsToInsert)
-  }
+
+  await db.transaction(async (rawTx) => {
+    const tx = rawTx as unknown as AppDb
+    await tx.insert(tables).values({
+      id: tableId,
+      orgId,
+      baseId: base.id,
+      name: input.name,
+      description: input.description,
+      rank: tableRank,
+      status: "active",
+    })
+
+    await tx.insert(fields).values(
+      plannedFields.map((field) => ({
+        id: field.id,
+        orgId,
+        tableId,
+        name: field.name,
+        type: field.type,
+        config: field.config as unknown as Record<string, unknown>,
+        rank: field.rank,
+        width: field.width,
+        isPrimary: field.isPrimary,
+        frozen: field.isPrimary,
+        status: "active",
+      })),
+    )
+
+    const autoNumberFields = plannedFields.filter(
+      (field) => field.type === "autoNumber",
+    )
+    if (autoNumberFields.length > 0) {
+      await tx.insert(fieldSequences).values(
+        autoNumberFields.map((field) => ({
+          fieldId: field.id,
+          tableId,
+          nextValue: (input.sampleRows?.length ?? 0) + 1,
+        })),
+      )
+    }
+
+    await tx.insert(views).values(
+      plannedViews.map((view, index) => ({
+        id: viewIds[index],
+        orgId,
+        tableId,
+        name: view.name,
+        type: view.type,
+        isDefault: view.type === "grid",
+        rank: `a${index}`,
+        configuration: view.configuration,
+        status: "active",
+      })),
+    )
+
+    if (recordsToInsert.length > 0) {
+      await tx.insert(records).values(recordsToInsert)
+    }
+  })
 
   const output: z.infer<typeof createTableOutputSchema> = {
     tableId,
@@ -1332,51 +1518,43 @@ async function executeCreateRecord(
   const values = resolveRecordValues({ fields: definitions, values: input.values })
   const autoNumberFields = definitions.filter((field) => field.type === "autoNumber")
 
-  if (autoNumberFields.length > 0) {
-    await ctx.db
-      .insert(fieldSequences)
-      .values(
-        autoNumberFields.map((field) => ({
-          fieldId: field.id,
-          tableId: table.id,
-          nextValue: 1,
-        })),
+  const recordId = await ctx.db.transaction(async (rawTx) => {
+    const tx = rawTx as unknown as AppDb
+
+    if (autoNumberFields.length > 0) {
+      // One atomic `next_value + 1` per field; a read-then-write lost numbers
+      // when two records were created at the same time.
+      const allocated = await allocateSequenceValues(
+        tx,
+        table.id,
+        autoNumberFields.map((field) => field.id),
+        1,
       )
-      .onConflictDoNothing()
-  }
+      for (const field of autoNumberFields) {
+        values[field.id] = allocated[field.id]
+      }
+    }
 
-  for (const field of autoNumberFields) {
-    const [sequence] = await ctx.db
-      .select({ nextValue: fieldSequences.nextValue })
-      .from(fieldSequences)
-      .where(eq(fieldSequences.fieldId, field.id))
-      .limit(1)
-    const nextValue = sequence?.nextValue ?? 1
-    values[field.id] = nextValue
-    await ctx.db
-      .update(fieldSequences)
-      .set({ nextValue: nextValue + 1 })
-      .where(eq(fieldSequences.fieldId, field.id))
-  }
+    const now = new Date()
+    for (const field of definitions) {
+      if (field.type === "createdTime") values[field.id] = now.getTime()
+      if (field.type === "createdBy") values[field.id] = ctx.session.userId
+    }
 
-  const now = new Date()
-  for (const field of definitions) {
-    if (field.type === "createdTime") values[field.id] = now.getTime()
-    if (field.type === "createdBy") values[field.id] = ctx.session.userId
-  }
-
-  const recordId = `rec_${nanoid(10)}`
-  await ctx.db.insert(records).values({
-    id: recordId,
-    orgId: ctx.session.orgId,
-    tableId: table.id,
-    rank: await nextRecordRank(ctx, table.id),
-    values,
-    searchText: buildRecordSearchText(values, definitions),
-    revision: 1,
-    status: "active",
-    createdBy: ctx.session.userId,
-    updatedBy: ctx.session.userId,
+    const id = `rec_${nanoid(10)}`
+    await tx.insert(records).values({
+      id,
+      orgId: ctx.session.orgId,
+      tableId: table.id,
+      rank: await nextRecordRank(ctx, table.id, tx),
+      values,
+      searchText: buildRecordSearchText(values, definitions),
+      revision: 1,
+      status: "active",
+      createdBy: ctx.session.userId,
+      updatedBy: ctx.session.userId,
+    })
+    return id
   })
 
   return {
@@ -1469,7 +1647,10 @@ async function executeUpdateRecord(
     values[field.id] = validateCellValue(field, resolved)
   }
 
-  if (JSON.stringify(values).length > MAX_RECORD_VALUE_BYTES) {
+  // UTF-8 bytes, matching `lib/cell-validation.ts`; `.length` counted UTF-16
+  // code units and let multi-byte payloads through.
+  const serializedSize = new TextEncoder().encode(JSON.stringify(values)).length
+  if (serializedSize > MAX_RECORD_VALUE_BYTES) {
     throw new AppError(
       "VALIDATION_ERROR",
       `Record payload exceeds the ${MAX_RECORD_VALUE_BYTES.toLocaleString()} byte limit.`,
@@ -1557,7 +1738,7 @@ async function executeDeleteRecord(
   const deleted = await ctx.db
     .update(records)
     .set({
-      status: "deleted",
+      status: "archived",
       revision: row.revision + 1,
       updatedAt: new Date(),
       updatedBy: ctx.session.userId,
@@ -1605,6 +1786,9 @@ async function proposeDeleteField(
       "This column changed while you were reviewing it. Refresh and try again.",
     )
   }
+  if (field.isPrimary) {
+    throw new AppError("VALIDATION_ERROR", "The primary field cannot be deleted.")
+  }
 
   return {
     operation: "delete_field",
@@ -1639,16 +1823,19 @@ async function executeDeleteField(
       "This column changed while you were reviewing it. Refresh and try again.",
     )
   }
+  if (field.isPrimary) {
+    throw new AppError("VALIDATION_ERROR", "The primary field cannot be deleted.")
+  }
 
   await ctx.db
     .update(fields)
-    .set({ status: "deleted", updatedAt: new Date() })
+    .set({ status: "archived", updatedAt: new Date() })
     .where(
-      and(
-        eq(fields.orgId, ctx.session.orgId),
-        eq(fields.id, field.id),
-      ),
+      and(eq(fields.orgId, ctx.session.orgId), eq(fields.id, field.id)),
     )
+  // Archived columns must also disappear from search text, exactly like the
+  // workspace delete path in `services/fields.ts`.
+  await rebuildTableSearchText(ctx.db, ctx.session.orgId, table.id)
 
   return {
     operation: "delete_field",
@@ -2153,8 +2340,12 @@ async function nextViewRank(ctx: AiToolContext, tableId: string) {
   return generateKeyBetween(rows[0]?.rank ?? null, null)
 }
 
-async function nextRecordRank(ctx: AiToolContext, tableId: string) {
-  const rows = await ctx.db
+async function nextRecordRank(
+  ctx: AiToolContext,
+  tableId: string,
+  db: AppDb = ctx.db,
+) {
+  const rows = await db
     .select({ rank: records.rank })
     .from(records)
     .where(
@@ -2471,24 +2662,26 @@ function roundNumber(value: number): number {
   return Math.round(value * 1_000_000) / 1_000_000 || 0
 }
 
-function compareCellValues(
-  left: unknown,
-  right: unknown,
-  descending: boolean,
-): number {
-  const leftNumber = typeof left === "number" ? left : Number(left)
-  const rightNumber = typeof right === "number" ? right : Number(right)
-  const bothNumeric =
-    isPopulated(left) &&
-    isPopulated(right) &&
-    Number.isFinite(leftNumber) &&
-    Number.isFinite(rightNumber)
-  const result = bothNumeric
-    ? leftNumber - rightNumber
-    : String(left ?? "").localeCompare(String(right ?? ""))
-  return descending ? -result : result
+/**
+ * Sort key for one column, typed the way the column stores its values: numbers
+ * and timestamps compare numerically, text compares case-insensitively.
+ */
+function sortExpression(field: FieldDefinition) {
+  const raw = sql`${records.values} ->> ${field.id}`
+  switch (field.type) {
+    case "number":
+    case "currency":
+    case "percent":
+    case "rating":
+    case "date":
+    case "createdTime":
+      return sql`nullif(${raw}, '')::double precision`
+    case "checkbox":
+      return sql`case when ${raw} = 'true' then 1 else 0 end`
+    default:
+      return sql`lower(${raw})`
+  }
 }
-
 
 function parseCursor(cursor: string | undefined): number {
   if (!cursor) return 0

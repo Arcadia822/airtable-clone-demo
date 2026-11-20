@@ -564,6 +564,8 @@ export const assistantProposalSchema = z
     diff: z.array(assistantDiffRowSchema).max(20),
     input: z.record(z.string().max(240), jsonValueSchema),
     warnings: z.array(z.string().trim().min(1).max(500)).max(10),
+    /** Server-issued, single-use approval ticket for the write route. */
+    token: z.string().trim().min(8).max(120),
   })
   .strict();
 

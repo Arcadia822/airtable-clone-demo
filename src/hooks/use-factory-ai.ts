@@ -416,6 +416,7 @@ export function useFactoryAi(options: UseFactoryAiOptions = {}): UseFactoryAiRes
         body: JSON.stringify({
           input: proposal.input,
           operation: proposal.operation,
+          token: proposal.token,
         }),
         headers: { "content-type": "application/json" },
         method: "POST",

@@ -22,6 +22,7 @@ import {
   describeTable,
   formAnalytics,
   inspectForm,
+  issueWriteProposalToken,
   listRecords,
   summarizeTable,
   type AiToolContext,
@@ -251,8 +252,11 @@ async function emitWriteProposal(params: {
 
   const action = parseAction(response.text, baseId)
   const proposal = await buildWriteProposal(ctx, action.operation, action.input)
+  // The approval ticket is minted here, server-side, and travels with the
+  // proposal. Without it the write route refuses to execute anything.
+  const token = await issueWriteProposalToken(ctx, proposal)
 
-  emit({ proposal, type: "proposal" })
+  emit({ proposal: { ...proposal, token }, type: "proposal" })
   emit({
     citations: facts.citations,
     requestId: response.requestId,
