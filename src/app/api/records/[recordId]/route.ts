@@ -1,6 +1,6 @@
 import { getDb } from "@/db/client"
 import { requireSession } from "@/server/auth"
-import { jsonError, jsonOk } from "@/server/http"
+import { jsonError, jsonOk, requireSameOrigin } from "@/server/http"
 import { deleteRecord, getRecord, updateRecord } from "@/server/services/records"
 
 export const runtime = "nodejs"
@@ -20,6 +20,7 @@ export async function GET(request: Request, context: Context) {
 
 export async function PATCH(request: Request, context: Context) {
   try {
+    requireSameOrigin(request)
     const session = await requireSession(request)
     const { recordId } = await context.params
     const db = await getDb()
@@ -32,6 +33,7 @@ export async function PATCH(request: Request, context: Context) {
 
 export async function DELETE(request: Request, context: Context) {
   try {
+    requireSameOrigin(request)
     const session = await requireSession(request)
     const { recordId } = await context.params
     const db = await getDb()

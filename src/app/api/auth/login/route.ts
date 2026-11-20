@@ -2,13 +2,17 @@ import crypto from "node:crypto"
 import { NextResponse } from "next/server"
 
 import {
+  assertTrustedAuthorizeUrl,
   getFactoryAuthConfig,
+  isAuthMisconfigured,
   isOriginDeniedResponse,
   resolveAppOrigin,
   sanitizeReturnTo,
+  VISITOR_COOKIES_ARE_HOST_PREFIXED,
   VISITOR_RETURN_COOKIE,
   VISITOR_STATE_COOKIE,
 } from "@/server/auth"
+import { HttpStatusError, jsonError } from "@/server/http"
 
 export const runtime = "nodejs"
 
@@ -21,10 +25,37 @@ export async function handleVisitorAuthStart(
   const config = getFactoryAuthConfig()
 
   if (!config) {
+    // A deployed instance with no credentials must not pretend the user is
+    // signed in; it reports the misconfiguration instead.
+    if (isAuthMisconfigured()) {
+      return jsonError(
+        new HttpStatusError(
+          "AUTH_NOT_CONFIGURED",
+          "Authentication is not configured for this deployment.",
+          503,
+        ),
+      )
+    }
     return NextResponse.redirect(new URL(returnTo, resolveAppOrigin(request)), 303)
   }
 
   const origin = resolveAppOrigin(request)
+  const secureOrigin = origin.startsWith("https://")
+
+  // `__Host-` cookies are only accepted with `Secure`, which browsers refuse to
+  // store over plain http. Refuse up front instead of issuing a cookie that
+  // silently never arrives.
+  if (VISITOR_COOKIES_ARE_HOST_PREFIXED && !secureOrigin) {
+    return jsonError(
+      new HttpStatusError(
+        "AUTH_INSECURE_ORIGIN",
+        "Sign-in requires a secure (https) origin. Open the app from its registered https URL.",
+        503,
+        { origin },
+      ),
+    )
+  }
+
   const state = crypto.randomBytes(24).toString("base64url")
   const callbackUrl = `${origin}/api/auth/callback`
 
@@ -78,22 +109,24 @@ export async function handleVisitorAuthStart(
     )
   }
 
-  const response = NextResponse.redirect(redirectTarget, 303)
-  const isSecure = origin.startsWith("https://")
-  response.cookies.set(VISITOR_STATE_COOKIE, state, {
+  let trustedRedirect: string
+  try {
+    trustedRedirect = assertTrustedAuthorizeUrl(redirectTarget, config.url)
+  } catch (error) {
+    return jsonError(error)
+  }
+
+  const response = NextResponse.redirect(trustedRedirect, 303)
+  const cookieOptions = {
     httpOnly: true,
-    sameSite: "lax",
-    secure: isSecure,
+    sameSite: "lax" as const,
+    // Always Secure for `__Host-` names; https otherwise.
+    secure: VISITOR_COOKIES_ARE_HOST_PREFIXED || secureOrigin,
     path: "/",
     maxAge: 600,
-  })
-  response.cookies.set(VISITOR_RETURN_COOKIE, returnTo, {
-    httpOnly: true,
-    sameSite: "lax",
-    secure: isSecure,
-    path: "/",
-    maxAge: 600,
-  })
+  }
+  response.cookies.set(VISITOR_STATE_COOKIE, state, cookieOptions)
+  response.cookies.set(VISITOR_RETURN_COOKIE, returnTo, cookieOptions)
   return response
 }
 

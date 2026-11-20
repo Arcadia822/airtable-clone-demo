@@ -1,6 +1,6 @@
 import { getDb } from "@/db/client"
 import { requireSession } from "@/server/auth"
-import { jsonError, jsonOk } from "@/server/http"
+import { jsonError, jsonOk, requireSameOrigin } from "@/server/http"
 import { generateFormDraft } from "@/server/services/forms"
 
 export const runtime = "nodejs"
@@ -19,6 +19,7 @@ interface RouteContext {
 
 export async function POST(request: Request, context: RouteContext) {
   try {
+    requireSameOrigin(request)
     const session = await requireSession(request)
     const { formId } = await context.params
     const db = await getDb()

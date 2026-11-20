@@ -1,6 +1,6 @@
 import { getDb } from "@/db/client"
 import { requireSession } from "@/server/auth"
-import { jsonError, jsonOk } from "@/server/http"
+import { jsonError, jsonOk, requireSameOrigin } from "@/server/http"
 import { getFormDraft, replaceFormDraft } from "@/server/services/forms"
 
 export const runtime = "nodejs"
@@ -30,6 +30,7 @@ export async function GET(request: Request, context: RouteContext) {
 
 export async function PATCH(request: Request, context: RouteContext) {
   try {
+    requireSameOrigin(request)
     const session = await requireSession(request)
     const { formId } = await context.params
     const db = await getDb()

@@ -1,6 +1,6 @@
 import { getDb } from "@/db/client"
 import { requireSession } from "@/server/auth"
-import { jsonError, jsonOk } from "@/server/http"
+import { jsonError, jsonOk, requireSameOrigin } from "@/server/http"
 import { createView, listViews } from "@/server/services/views"
 
 export const runtime = "nodejs"
@@ -18,6 +18,7 @@ export async function GET(request: Request) {
 
 export async function POST(request: Request) {
   try {
+    requireSameOrigin(request)
     const session = await requireSession(request)
     const db = await getDb()
     const body = await request.json().catch(() => ({}))

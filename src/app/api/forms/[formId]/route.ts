@@ -1,6 +1,6 @@
 import { getDb } from "@/db/client"
 import { requireSession } from "@/server/auth"
-import { jsonError, jsonOk } from "@/server/http"
+import { jsonError, jsonOk, requireSameOrigin } from "@/server/http"
 import {
   deleteForm,
   getFormDetail,
@@ -34,6 +34,7 @@ export async function GET(request: Request, context: RouteContext) {
 
 export async function PATCH(request: Request, context: RouteContext) {
   try {
+    requireSameOrigin(request)
     const session = await requireSession(request)
     const { formId } = await context.params
     const db = await getDb()
@@ -47,6 +48,7 @@ export async function PATCH(request: Request, context: RouteContext) {
 
 export async function DELETE(request: Request, context: RouteContext) {
   try {
+    requireSameOrigin(request)
     const session = await requireSession(request)
     const { formId } = await context.params
     const db = await getDb()

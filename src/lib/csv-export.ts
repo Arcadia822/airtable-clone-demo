@@ -5,10 +5,18 @@ import type {
   GridRecord,
 } from "@/lib/domain"
 
+/**
+ * Spreadsheet apps evaluate a cell that starts with `=`, `+`, `-`, `@`, or a
+ * control character as a formula. A leading apostrophe keeps the value as text
+ * (CSV injection mitigation) and applies to headers as well as values.
+ */
+const FORMULA_PREFIX_PATTERN = /^[=+\-@\t\r]/
+
 function csvCell(value: string): string {
-  return /[",\r\n]/.test(value)
-    ? `"${value.replaceAll('"', '""')}"`
-    : value
+  const safe = FORMULA_PREFIX_PATTERN.test(value) ? `'${value}` : value
+  return /[",\r\n]/.test(safe)
+    ? `"${safe.replaceAll('"', '""')}"`
+    : safe
 }
 
 function optionLabel(field: FieldDefinition, optionId: string) {

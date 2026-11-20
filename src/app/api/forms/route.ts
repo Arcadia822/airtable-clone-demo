@@ -1,6 +1,6 @@
 import { getDb } from "@/db/client"
 import { requireSession } from "@/server/auth"
-import { jsonError, jsonOk } from "@/server/http"
+import { jsonError, jsonOk, requireSameOrigin } from "@/server/http"
 import { AppError } from "@/lib/domain"
 import {
   createForm,
@@ -47,6 +47,7 @@ export async function GET(request: Request) {
 }
 export async function POST(request: Request) {
   try {
+    requireSameOrigin(request)
     const session = await requireSession(request)
     const db = await getDb()
     const detail = await createForm(
