@@ -76,7 +76,7 @@ async function uploadAttachment(
     message?: string
   }>(sessionResponse)
   if (!sessionResponse.ok || !session?.uploadSessionId || !session.uploadUrl) {
-    throw new Error(session?.message ?? `${file.name} 上传失败。`)
+    throw new Error(session?.message ?? `${file.name} could not be uploaded.`)
   }
 
   const separator = session.uploadUrl.includes("?") ? "&" : "?"
@@ -98,7 +98,7 @@ async function uploadAttachment(
     message?: string
   }>(uploadResponse)
   if (!uploadResponse.ok || !upload?.storageId) {
-    throw new Error(upload?.message ?? `${file.name} 上传失败。`)
+    throw new Error(upload?.message ?? `${file.name} could not be uploaded.`)
   }
 
   const finalizeResponse = await fetch("/api/attachments/finalize", {
@@ -123,12 +123,12 @@ async function uploadAttachment(
     message?: string
   }>(finalizeResponse)
   if (!finalizeResponse.ok) {
-    throw new Error(finalized?.message ?? `${file.name} 上传失败。`)
+    throw new Error(finalized?.message ?? `${file.name} could not be uploaded.`)
   }
   const attachment = finalized?.attachment
   const attachmentId = attachment?.attachmentId ?? attachment?.id
   if (!attachment || !attachmentId) {
-    throw new Error(`${file.name} 上传失败。`)
+    throw new Error(`${file.name} could not be uploaded.`)
   }
 
   return {

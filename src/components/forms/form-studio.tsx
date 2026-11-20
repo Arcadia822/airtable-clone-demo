@@ -180,7 +180,7 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
     | { message?: string }
     | null
   if (!response.ok) {
-    throw new Error(payload?.message ?? "请求失败，请重试。")
+    throw new Error(payload?.message ?? "The request failed. Try again.")
   }
   return payload as T
 }
@@ -188,7 +188,7 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
 function errorMessage(error: unknown): string {
   return error instanceof Error && error.message
     ? error.message
-    : "操作失败，请重试。"
+    : "That action failed. Try again."
 }
 
 function formatDateTime(value: string): string {
@@ -255,9 +255,9 @@ function toPreview(
 }
 
 const STATUS_LABELS: Record<FormRecordDto["status"], string> = {
-  draft: "草稿",
-  published: "已发布",
-  closed: "已关闭",
+  draft: "Draft",
+  published: "Published",
+  closed: "Closed",
 }
 
 export function FormStudio({ baseId, formId }: FormStudioProps) {
@@ -396,7 +396,7 @@ export function FormStudio({ baseId, formId }: FormStudioProps) {
       setDraft(result.fields)
       setDirty(false)
       setPickedFieldIds(result.fields.map((field) => field.targetFieldId))
-      if (!options.silent) setNotice("问题已保存")
+      if (!options.silent) setNotice("Questions saved")
       return true
     } catch (saveError) {
       setError(errorMessage(saveError))
@@ -423,7 +423,7 @@ export function FormStudio({ baseId, formId }: FormStudioProps) {
       setDraft(result.fields)
       setPickedFieldIds(result.fields.map((field) => field.targetFieldId))
       setDirty(false)
-      setNotice("已根据勾选字段生成问题")
+      setNotice("Questions generated from the selected fields")
     } catch (generateError) {
       setError(errorMessage(generateError))
     } finally {
@@ -444,7 +444,7 @@ export function FormStudio({ baseId, formId }: FormStudioProps) {
         version: { versionNumber: number }
         publicUrl: string
       }>(`/api/forms/${formId}/publish`, { method: "POST" })
-      setNotice(`已发布第 ${result.version.versionNumber} 版`)
+      setNotice(`Published version ${result.version.versionNumber}`)
       await load()
     } catch (publishError) {
       setError(errorMessage(publishError))
@@ -463,10 +463,10 @@ export function FormStudio({ baseId, formId }: FormStudioProps) {
       setDetail(next)
       setNotice(
         status === "closed"
-          ? "表单已关闭，不再接受提交"
+          ? "Form closed. Submissions are no longer accepted."
           : status === "published"
-            ? "表单已重新开放"
-            : "表单已移回草稿",
+            ? "Form reopened"
+            : "Form moved back to draft",
       )
     } catch (statusError) {
       setError(errorMessage(statusError))
@@ -495,7 +495,7 @@ export function FormStudio({ baseId, formId }: FormStudioProps) {
       setSettingsAccent(next.form.theme.accent)
       setSettingsThankYouTitle(next.form.thankYou.title)
       setSettingsThankYouMessage(next.form.thankYou.message)
-      setNotice("表单设置已保存")
+      setNotice("Form settings saved")
     } catch (settingsError) {
       setError(errorMessage(settingsError))
     } finally {
@@ -522,7 +522,7 @@ export function FormStudio({ baseId, formId }: FormStudioProps) {
     const url = `${window.location.origin}/f/${detail.form.slug}`
     try {
       await navigator.clipboard.writeText(url)
-      setNotice("公开链接已复制")
+      setNotice("Public link copied")
     } catch {
       setNotice(url)
     }
@@ -541,7 +541,7 @@ export function FormStudio({ baseId, formId }: FormStudioProps) {
       <div className="grid min-h-dvh place-items-center bg-muted/20 px-4">
         <div className="flex items-center gap-3 text-sm text-muted-foreground">
           <Loader2 className="size-4 animate-spin" />
-          正在载入表单…
+          Loading form…
         </div>
       </div>
     )
@@ -552,12 +552,14 @@ export function FormStudio({ baseId, formId }: FormStudioProps) {
       <div className="grid min-h-dvh place-items-center bg-muted/20 px-4">
         <Card className="w-full max-w-md">
           <CardHeader>
-            <CardTitle>无法打开表单</CardTitle>
-            <CardDescription>{error ?? "表单不存在或已被删除。"}</CardDescription>
+            <CardTitle>This form could not be opened</CardTitle>
+            <CardDescription>
+              {error ?? "The form does not exist or was deleted."}
+            </CardDescription>
           </CardHeader>
           <CardContent>
             <Button variant="outline" onClick={() => void load()}>
-              重试
+              Retry
             </Button>
           </CardContent>
         </Card>
@@ -573,8 +575,8 @@ export function FormStudio({ baseId, formId }: FormStudioProps) {
         <div className="mx-auto flex max-w-7xl flex-wrap items-center gap-3 px-4 py-4 sm:px-6">
           <div className="min-w-0 flex-1">
             <p className="text-xs text-muted-foreground">
-              {detail.base?.name ?? baseId} / {detail.table?.name ?? "数据表"} /
-              表单
+              {detail.base?.name ?? baseId} / {detail.table?.name ?? "Table"} /
+              Form
             </p>
             <div className="mt-1 flex flex-wrap items-center gap-2">
               <h1 className="truncate text-xl font-semibold tracking-tight">
@@ -593,7 +595,7 @@ export function FormStudio({ baseId, formId }: FormStudioProps) {
               </Badge>
               {detail.publishedVersion ? (
                 <span className="text-xs text-muted-foreground">
-                  第 {detail.publishedVersion.versionNumber} 版
+                  Version {detail.publishedVersion.versionNumber}
                 </span>
               ) : null}
             </div>
@@ -606,7 +608,7 @@ export function FormStudio({ baseId, formId }: FormStudioProps) {
               onClick={() => void copyPublicLink()}
             >
               <ClipboardCopy className="size-4" />
-              复制链接
+              Copy link
             </Button>
             <Button
               variant="ghost"
@@ -617,7 +619,7 @@ export function FormStudio({ baseId, formId }: FormStudioProps) {
               }
             >
               <Eye className="size-4" />
-              打开
+              Open
             </Button>
             {detail.form.status === "published" ? (
               <Button
@@ -626,7 +628,7 @@ export function FormStudio({ baseId, formId }: FormStudioProps) {
                 onClick={() => void changeStatus("closed")}
               >
                 <Lock className="size-4" />
-                关闭表单
+                Close form
               </Button>
             ) : null}
             {detail.form.status === "closed" ? (
@@ -636,7 +638,7 @@ export function FormStudio({ baseId, formId }: FormStudioProps) {
                 onClick={() => void changeStatus("published")}
               >
                 <Unlock className="size-4" />
-                重新开放
+                Reopen form
               </Button>
             ) : null}
             <Button
@@ -649,7 +651,7 @@ export function FormStudio({ baseId, formId }: FormStudioProps) {
               ) : (
                 <Rocket className="size-4" />
               )}
-              {detail.form.status === "published" ? "发布新版本" : "发布表单"}
+              {detail.form.status === "published" ? "Publish new version" : "Publish form"}
             </Button>
           </div>
         </div>
@@ -660,15 +662,16 @@ export function FormStudio({ baseId, formId }: FormStudioProps) {
           </code>
           {detail.form.status === "published" ? (
             <span className="text-xs text-muted-foreground">
-              任何拿到链接的人都可以填写
+              Anyone with the link can fill this in
             </span>
           ) : (
             <span className="text-xs text-muted-foreground">
-              发布后公开链接才会生效
+              The public link goes live after you publish
             </span>
           )}
           <span className="ml-auto text-xs text-muted-foreground">
-            {detail.submissionCount} 份回复
+            {detail.submissionCount}{" "}
+            {detail.submissionCount === 1 ? "response" : "responses"}
           </span>
         </div>
       </header>
@@ -694,9 +697,9 @@ export function FormStudio({ baseId, formId }: FormStudioProps) {
         <div className="mb-5 flex flex-wrap items-center gap-2">
           {(
             [
-              ["questions", ListChecks, "问题编辑"],
-              ["preview", Eye, "实时预览"],
-              ["responses", Users, "回复"],
+              ["questions", ListChecks, "Questions"],
+              ["preview", Eye, "Live preview"],
+              ["responses", Users, "Responses"],
             ] as const
           ).map(([value, Icon, label]) => (
             <Button
@@ -716,7 +719,7 @@ export function FormStudio({ baseId, formId }: FormStudioProps) {
               onClick={() => setSettingsOpen((open) => !open)}
             >
               <Settings2 className="size-4" />
-              表单设置
+              Form settings
             </Button>
             <Button
               size="sm"
@@ -728,7 +731,7 @@ export function FormStudio({ baseId, formId }: FormStudioProps) {
               ) : (
                 <Check className="size-4" />
               )}
-              保存修改
+              Save changes
             </Button>
           </div>
         </div>
@@ -736,14 +739,14 @@ export function FormStudio({ baseId, formId }: FormStudioProps) {
         {settingsOpen ? (
           <Card className="mb-5">
             <CardHeader>
-              <CardTitle>表单设置</CardTitle>
+              <CardTitle>Form settings</CardTitle>
               <CardDescription>
-                标题、说明、主色和提交成功文案都会随下一个版本一起发布。
+                Title, description, accent colour, and thank-you copy ship with the next version.
               </CardDescription>
             </CardHeader>
             <CardContent className="grid gap-4 sm:grid-cols-2">
               <div className="grid gap-2">
-                <Label htmlFor="form-name">表单名称</Label>
+                <Label htmlFor="form-name">Form name</Label>
                 <Input
                   id="form-name"
                   value={settingsName}
@@ -751,7 +754,7 @@ export function FormStudio({ baseId, formId }: FormStudioProps) {
                 />
               </div>
               <div className="grid gap-2">
-                <Label htmlFor="form-accent">主色</Label>
+                <Label htmlFor="form-accent">Accent colour</Label>
                 <div className="flex items-center gap-2">
                   <input
                     id="form-accent"
@@ -772,7 +775,7 @@ export function FormStudio({ baseId, formId }: FormStudioProps) {
                 </div>
               </div>
               <div className="grid gap-2 sm:col-span-2">
-                <Label htmlFor="form-description">说明</Label>
+                <Label htmlFor="form-description">Description</Label>
                 <Textarea
                   id="form-description"
                   value={settingsDescription}
@@ -783,7 +786,7 @@ export function FormStudio({ baseId, formId }: FormStudioProps) {
                 />
               </div>
               <div className="grid gap-2">
-                <Label htmlFor="form-thank-you-title">提交成功标题</Label>
+                <Label htmlFor="form-thank-you-title">Thank-you title</Label>
                 <Input
                   id="form-thank-you-title"
                   value={settingsThankYouTitle}
@@ -793,7 +796,7 @@ export function FormStudio({ baseId, formId }: FormStudioProps) {
                 />
               </div>
               <div className="grid gap-2">
-                <Label htmlFor="form-thank-you-message">提交成功说明</Label>
+                <Label htmlFor="form-thank-you-message">Thank-you message</Label>
                 <Input
                   id="form-thank-you-message"
                   value={settingsThankYouMessage}
@@ -808,7 +811,7 @@ export function FormStudio({ baseId, formId }: FormStudioProps) {
                   disabled={saving}
                   onClick={() => void saveSettings()}
                 >
-                  保存设置
+                  Save settings
                 </Button>
               </div>
             </CardContent>
@@ -819,14 +822,14 @@ export function FormStudio({ baseId, formId }: FormStudioProps) {
           <div className="grid gap-5 lg:grid-cols-[minmax(0,290px)_minmax(0,1fr)]">
             <Card className="h-fit lg:sticky lg:top-4">
               <CardHeader>
-                <CardTitle>选择字段</CardTitle>
+                <CardTitle>Choose fields</CardTitle>
                 <CardDescription>
-                  勾选要出现在表单里的数据表字段，然后一键生成问题。
+                  Tick the table fields this form should collect, then generate questions in one click.
                 </CardDescription>
               </CardHeader>
               <CardContent className="grid gap-3">
                 <div className="flex items-center justify-between text-xs text-muted-foreground">
-                  <span>{eligibleFields.length} 个可填写字段</span>
+                  <span>{eligibleFields.length} fillable fields</span>
                   <button
                     type="button"
                     className="underline-offset-4 hover:underline"
@@ -839,8 +842,8 @@ export function FormStudio({ baseId, formId }: FormStudioProps) {
                     }
                   >
                     {pickedFieldIds.length === eligibleFields.length
-                      ? "取消全选"
-                      : "全选"}
+                      ? "Clear all"
+                      : "Select all"}
                   </button>
                 </div>
 
@@ -868,7 +871,7 @@ export function FormStudio({ baseId, formId }: FormStudioProps) {
                           </span>
                           <span className="block text-xs text-muted-foreground">
                             {getFieldTypeLabel(field.type)}
-                            {field.isPrimary ? " · 主字段" : ""}
+                            {field.isPrimary ? " · Primary field" : ""}
                           </span>
                         </span>
                       </label>
@@ -879,7 +882,7 @@ export function FormStudio({ baseId, formId }: FormStudioProps) {
                 <Separator />
 
                 <div className="grid gap-2">
-                  <Label htmlFor="generate-mode">生成方式</Label>
+                  <Label htmlFor="generate-mode">Generate mode</Label>
                   <Select
                     value={generateMode}
                     onValueChange={(value) =>
@@ -890,8 +893,8 @@ export function FormStudio({ baseId, formId }: FormStudioProps) {
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
-                      <SelectItem value="replace">替换现有问题</SelectItem>
-                      <SelectItem value="append">追加到现有问题</SelectItem>
+                      <SelectItem value="replace">Replace existing questions</SelectItem>
+                      <SelectItem value="append">Append to existing questions</SelectItem>
                     </SelectContent>
                   </Select>
                 </div>
@@ -905,7 +908,7 @@ export function FormStudio({ baseId, formId }: FormStudioProps) {
                   ) : (
                     <Plus className="size-4" />
                   )}
-                  从勾选字段一键生成
+                  Generate from selected fields
                 </Button>
               </CardContent>
             </Card>
@@ -915,9 +918,9 @@ export function FormStudio({ baseId, formId }: FormStudioProps) {
                 <Card>
                   <CardContent className="grid place-items-center gap-2 py-12 text-center">
                     <FileText className="size-8 text-muted-foreground" />
-                    <p className="font-medium">还没有问题</p>
+                    <p className="font-medium">No questions yet</p>
                     <p className="max-w-sm text-sm text-muted-foreground">
-                      在左侧勾选字段并生成问题，或从已有字段追加。
+                      Select fields on the left to generate questions, or append to the existing ones.
                     </p>
                   </CardContent>
                 </Card>
@@ -930,18 +933,18 @@ export function FormStudio({ baseId, formId }: FormStudioProps) {
                         <div className="flex flex-wrap items-center gap-2">
                           <Badge variant="outline">Q{index + 1}</Badge>
                           <CardTitle className="text-base">
-                            {question.label || field?.name || "未命名问题"}
+                            {question.label || field?.name || "Untitled question"}
                           </CardTitle>
                           <span className="text-xs text-muted-foreground">
                             {field
                               ? getFieldTypeLabel(field.type)
-                              : "字段不可用"}
+                              : "Field unavailable"}
                           </span>
                           <div className="ml-auto flex items-center gap-1">
                             <Button
                               variant="ghost"
                               size="icon-sm"
-                              aria-label="上移"
+                              aria-label="Move up"
                               disabled={index === 0}
                               onClick={() => moveQuestion(index, -1)}
                             >
@@ -950,7 +953,7 @@ export function FormStudio({ baseId, formId }: FormStudioProps) {
                             <Button
                               variant="ghost"
                               size="icon-sm"
-                              aria-label="下移"
+                              aria-label="Move down"
                               disabled={index === draft.length - 1}
                               onClick={() => moveQuestion(index, 1)}
                             >
@@ -959,7 +962,7 @@ export function FormStudio({ baseId, formId }: FormStudioProps) {
                             <Button
                               variant="ghost"
                               size="icon-sm"
-                              aria-label="删除问题"
+                              aria-label="Remove question"
                               onClick={() => removeQuestion(index)}
                             >
                               <Trash2 className="size-4" />
@@ -967,14 +970,16 @@ export function FormStudio({ baseId, formId }: FormStudioProps) {
                           </div>
                         </div>
                         <CardDescription>
-                          写入数据表列：
-                          {field?.name ?? "已移除的字段"}
+                          Writes to column:
+                          {field?.name ?? "Removed field"}
                         </CardDescription>
                       </CardHeader>
                       <CardContent className="grid gap-4">
                         <div className="grid gap-4 sm:grid-cols-2">
                           <div className="grid gap-2">
-                            <Label htmlFor={`label-${question.id}`}>问题标题</Label>
+                            <Label htmlFor={`label-${question.id}`}>
+                              Question label
+                            </Label>
                             <Input
                               id={`label-${question.id}`}
                               value={question.label}
@@ -987,7 +992,7 @@ export function FormStudio({ baseId, formId }: FormStudioProps) {
                           </div>
                           <div className="grid gap-2">
                             <Label htmlFor={`placeholder-${question.id}`}>
-                              占位提示
+                              Placeholder
                             </Label>
                             <Input
                               id={`placeholder-${question.id}`}
@@ -1001,7 +1006,7 @@ export function FormStudio({ baseId, formId }: FormStudioProps) {
                           </div>
                           <div className="grid gap-2 sm:col-span-2">
                             <Label htmlFor={`help-${question.id}`}>
-                              帮助文字
+                              Help text
                             </Label>
                             <Input
                               id={`help-${question.id}`}
@@ -1025,7 +1030,7 @@ export function FormStudio({ baseId, formId }: FormStudioProps) {
                                 })
                               }
                             />
-                            必填
+                            Required
                           </label>
                           <label className="flex items-center gap-2 text-sm">
                             <Switch
@@ -1036,16 +1041,16 @@ export function FormStudio({ baseId, formId }: FormStudioProps) {
                                 })
                               }
                             />
-                            隐藏问题
+                            Hide this question
                           </label>
                         </div>
 
                         <Separator />
 
                         <div className="grid gap-2">
-                          <p className="text-sm font-medium">显示条件</p>
+                          <p className="text-sm font-medium">Show when</p>
                           <p className="text-xs text-muted-foreground">
-                            满足条件时才向填写者显示这个字段。
+                            Only show this field when the conditions below are met.
                           </p>
                           <ConditionalLogicEditor
                             disabled={saving}
@@ -1094,7 +1099,7 @@ export function FormStudio({ baseId, formId }: FormStudioProps) {
               embedded
             />
             <p className="mx-auto mt-4 max-w-xl text-center text-xs text-muted-foreground">
-              预览模式下提交只会显示成功文案，不会写入记录。
+              Preview submissions only show the thank-you copy. No record is written.
             </p>
           </div>
         ) : null}
@@ -1103,7 +1108,7 @@ export function FormStudio({ baseId, formId }: FormStudioProps) {
           <Card>
             <CardHeader>
               <div className="flex flex-wrap items-center gap-2">
-                <CardTitle>回复</CardTitle>
+                <CardTitle>Responses</CardTitle>
                 <Badge variant="secondary">{submissions?.total ?? 0}</Badge>
                 <div className="ml-auto flex items-center gap-2">
                   <Button
@@ -1117,7 +1122,7 @@ export function FormStudio({ baseId, formId }: FormStudioProps) {
                       />
                     }
                   >
-                    导出 CSV
+                    Export CSV
                   </Button>
                   <Button
                     variant="outline"
@@ -1130,30 +1135,30 @@ export function FormStudio({ baseId, formId }: FormStudioProps) {
                     ) : (
                       <Users className="size-4" />
                     )}
-                    刷新
+                    Refresh
                   </Button>
                 </div>
               </div>
               <CardDescription>
-                每次提交都会在当前数据表里创建一条真实记录。
+                Every submission creates a real record in this table.
               </CardDescription>
             </CardHeader>
             <CardContent>
               {loadingSubmissions && !submissions ? (
                 <p className="py-8 text-center text-sm text-muted-foreground">
-                  正在载入回复…
+                  Loading responses…
                 </p>
               ) : !submissions || submissions.submissions.length === 0 ? (
                 <p className="py-8 text-center text-sm text-muted-foreground">
-                  还没有收到回复。发布表单并分享链接后，回复会出现在这里。
+                  No responses yet. Publish the form and share the link; responses appear here.
                 </p>
               ) : (
                 <div className="overflow-x-auto">
                   <Table>
                     <TableHeader>
                       <TableRow>
-                        <TableHead>提交时间</TableHead>
-                        <TableHead>版本</TableHead>
+                        <TableHead>Submitted</TableHead>
+                        <TableHead>Version</TableHead>
                         {submissions.columns.map((column) => (
                           <TableHead key={column.fieldId}>
                             {column.label}

@@ -454,6 +454,32 @@ export function useTableData(tableId: string) {
     [],
   )
 
+  /** Merges saved cell values into the local records so edits render immediately. */
+  const applyCellValues = useCallback(
+    (
+      updates: Array<{ recordId: string; fieldId: string; value: CellValue }>,
+    ) => {
+      if (!updates.length) return
+      const byRecordId = new Map<string, Map<string, CellValue>>()
+      for (const update of updates) {
+        const fields =
+          byRecordId.get(update.recordId) ?? new Map<string, CellValue>()
+        fields.set(update.fieldId, update.value)
+        byRecordId.set(update.recordId, fields)
+      }
+      setRecords((current) =>
+        current.map((record) => {
+          const fields = byRecordId.get(record.id)
+          if (!fields) return record
+          const values = { ...record.values }
+          for (const [fieldId, value] of fields) values[fieldId] = value
+          return { ...record, values }
+        }),
+      )
+    },
+    [],
+  )
+
   const updateCell = useCallback(
     (recordId: string, fieldId: string, value: CellValue, expectedRevision: number) => {
       setRecords((current) =>
@@ -504,6 +530,7 @@ export function useTableData(tableId: string) {
       value: CellValue
       expectedRevision: number
     }>) => {
+      applyCellValues(updates)
       setSyncing(true)
       try {
         const result = await requestJson<{ revisions: Record<string, number> }>(
@@ -526,7 +553,7 @@ export function useTableData(tableId: string) {
         setSyncing(false)
       }
     },
-    [applyRevisions, refreshRecords, tableId],
+    [applyCellValues, applyRevisions, refreshRecords, tableId],
   )
 
   const addRecord = useCallback(

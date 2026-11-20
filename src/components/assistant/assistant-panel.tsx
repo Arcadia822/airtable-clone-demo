@@ -588,32 +588,32 @@ function ReportRow({
 function buildSuggestions(context?: AssistantPageContext): ChatSuggestion[] {
   const suggestions: ChatSuggestion[] = [
     {
-      label: "帮我建一张客户跟进表（含状态、金额、序号、跟进日期）",
+      label: "Build a customer follow-up table (status, amount, number, follow-up date)",
       prompt:
-        "帮我建一张客户跟进表，包含客户名称、状态（线索、跟进中、已成交、已流失）、金额、序号和跟进日期，并加 4 行示例数据。",
+        "Build a customer follow-up table with customer name, status (lead, following up, won, lost), amount, an auto number, and a follow-up date. Add four sample rows.",
     },
   ]
 
   if (context?.table?.id) {
     suggestions.push({
-      label: "分析当前表的数据分布和关键指标",
-      prompt: `分析当前表「${context.table.name ?? "当前表"}」的数据分布和关键指标。`,
+      label: "Analyse this table's distribution and key metrics",
+      prompt: `Analyse the distribution and key metrics of the table "${context.table.name ?? "this table"}".`,
     })
     suggestions.push({
-      label: "按状态统计当前表的记录数并生成图表",
-      prompt: "按状态统计当前表的记录数并生成图表。",
+      label: "Count records by status and chart the result",
+      prompt: "Count the records in this table by status and chart the result.",
     })
     return suggestions
   }
 
   suggestions.push({
-    label: "帮我设计一张订单表（含状态、金额、客户、下单日期）",
+    label: "Design an orders table (status, amount, customer, order date)",
     prompt:
-      "帮我设计一张订单表，包含订单号、客户、状态、金额和下单日期，并加 3 行示例数据。",
+      "Design an orders table with an order number, customer, status, amount, and order date. Add three sample rows.",
   })
   suggestions.push({
-    label: "我的工作区里现在有哪些数据？",
-    prompt: "我的工作区里现在有哪些数据？请简要说明。",
+    label: "What data is in my workspace right now?",
+    prompt: "What data is in my workspace right now? Summarise it briefly.",
   })
   return suggestions
 }

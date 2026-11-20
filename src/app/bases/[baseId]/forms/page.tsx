@@ -71,9 +71,9 @@ interface CatalogResponse {
 }
 
 const STATUS_LABELS: Record<FormSummary["status"], string> = {
-  draft: "草稿",
-  published: "已发布",
-  closed: "已关闭",
+  draft: "Draft",
+  published: "Published",
+  closed: "Closed",
 }
 
 async function readJson<T>(response: Response): Promise<T | null> {
@@ -114,7 +114,7 @@ export default function BaseFormsPage() {
         response,
       )
       if (!response.ok || !payload) {
-        throw new Error(payload?.message ?? "无法载入这个 Base 的表单。")
+        throw new Error(payload?.message ?? "Could not load the forms for this base.")
       }
       setCatalog(payload)
       const firstTable = payload.tables[0]
@@ -123,7 +123,7 @@ export default function BaseFormsPage() {
       }
     } catch (loadError) {
       setError(
-        loadError instanceof Error ? loadError.message : "载入失败，请重试。",
+        loadError instanceof Error ? loadError.message : "Loading failed. Try again.",
       )
     } finally {
       setLoading(false)
@@ -155,7 +155,7 @@ export default function BaseFormsPage() {
         .map((field) => field.id),
     )
     if (!name.trim() && table) {
-      setName(`${table.name} 表单`)
+      setName(`${table.name} form`)
     }
   }
 
@@ -190,12 +190,12 @@ export default function BaseFormsPage() {
         message?: string
       }>(response)
       if (!response.ok || !payload?.form) {
-        throw new Error(payload?.message ?? "创建表单失败。")
+        throw new Error(payload?.message ?? "Could not create the form.")
       }
       router.push(`/bases/${baseId}/forms/${payload.form.id}`)
     } catch (createError) {
       setError(
-        createError instanceof Error ? createError.message : "创建表单失败。",
+        createError instanceof Error ? createError.message : "Could not create the form.",
       )
     } finally {
       setCreating(false)
@@ -206,7 +206,7 @@ export default function BaseFormsPage() {
     const url = `${window.location.origin}/f/${slug}`
     try {
       await navigator.clipboard.writeText(url)
-      setNotice("公开链接已复制")
+      setNotice("Public link copied")
     } catch {
       setNotice(url)
     }
@@ -223,19 +223,19 @@ export default function BaseFormsPage() {
             render={<Link href={`/bases/${baseId}`} />}
           >
             <ArrowLeft className="size-4" />
-            返回
+            Back
           </Button>
           <div className="min-w-0 flex-1">
             <p className="text-xs text-muted-foreground">
-              {catalog?.base.name ?? "Base"} / 表单
+              {catalog?.base.name ?? "Base"} / Forms
             </p>
             <h1 className="truncate text-xl font-semibold tracking-tight">
-              表单
+              Forms
             </h1>
           </div>
           <Button size="sm" onClick={openCreatePanel}>
             <Plus className="size-4" />
-            新建表单
+            New form
           </Button>
         </div>
       </header>
@@ -261,21 +261,21 @@ export default function BaseFormsPage() {
         {creatingOpen ? (
           <Card className="mb-6">
             <CardHeader>
-              <CardTitle>新建表单</CardTitle>
+              <CardTitle>New form</CardTitle>
               <CardDescription>
-                选择一张数据表和要收集的字段。表单提交后会直接写入这张表。
+                Pick a table and the fields you want to collect. Submissions are written straight into that table.
               </CardDescription>
             </CardHeader>
             <CardContent className="grid gap-5">
               {!catalog?.tables.length ? (
                 <p className="text-sm text-muted-foreground">
-                  这个 Base 里还没有可用的数据表。
+                  This base has no tables yet.
                 </p>
               ) : (
                 <>
                   <div className="grid gap-4 sm:grid-cols-2">
                     <div className="grid gap-2">
-                      <Label htmlFor="form-table">数据表</Label>
+                      <Label htmlFor="form-table">Table</Label>
                       <Select
                         value={tableId}
                         onValueChange={(value) => {
@@ -295,21 +295,21 @@ export default function BaseFormsPage() {
                       </Select>
                     </div>
                     <div className="grid gap-2">
-                      <Label htmlFor="form-name">表单名称</Label>
+                      <Label htmlFor="form-name">Form name</Label>
                       <Input
                         id="form-name"
                         value={name}
-                        placeholder="例如：项目需求收集"
+                        placeholder="e.g. Project request intake"
                         onChange={(event) => setName(event.target.value)}
                       />
                     </div>
                     <div className="grid gap-2 sm:col-span-2">
-                      <Label htmlFor="form-description">说明</Label>
+                      <Label htmlFor="form-description">Description</Label>
                       <Textarea
                         id="form-description"
                         value={description}
                         rows={2}
-                        placeholder="告诉填写者这个表单的用途。"
+                        placeholder="Tell people what this form is for."
                         onChange={(event) => setDescription(event.target.value)}
                       />
                     </div>
@@ -317,7 +317,7 @@ export default function BaseFormsPage() {
 
                   <div className="grid gap-2">
                     <div className="flex items-center justify-between">
-                      <Label>包含的字段</Label>
+                      <Label>Included fields</Label>
                       <button
                         type="button"
                         className="text-xs text-muted-foreground underline-offset-4 hover:underline"
@@ -330,8 +330,8 @@ export default function BaseFormsPage() {
                         }
                       >
                         {pickedFieldIds.length === eligibleFields.length
-                          ? "取消全选"
-                          : "全选"}
+                          ? "Clear all"
+                          : "Select all"}
                       </button>
                     </div>
                     <div className="grid max-h-72 gap-1 overflow-y-auto rounded-lg border p-2 sm:grid-cols-2">
@@ -382,13 +382,13 @@ export default function BaseFormsPage() {
                       ) : (
                         <Rocket className="size-4" />
                       )}
-                      创建表单
+                      Create form
                     </Button>
                     <Button
                       variant="ghost"
                       onClick={() => setCreatingOpen(false)}
                     >
-                      取消
+                      Cancel
                     </Button>
                   </div>
                 </>
@@ -400,19 +400,19 @@ export default function BaseFormsPage() {
         {loading ? (
           <p className="flex items-center gap-2 py-16 text-sm text-muted-foreground">
             <Loader2 className="size-4 animate-spin" />
-            正在载入表单…
+            Loading forms…
           </p>
         ) : !catalog?.forms.length ? (
           <Card>
             <CardContent className="grid place-items-center gap-2 py-16 text-center">
               <FileText className="size-8 text-muted-foreground" />
-              <p className="font-medium">还没有表单</p>
+              <p className="font-medium">No forms yet</p>
               <p className="max-w-sm text-sm text-muted-foreground">
-                从任意数据表创建表单，把公开链接分享给团队或客户。
+                Create a form from any table and share the public link with your team or customers.
               </p>
               <Button className="mt-2" onClick={openCreatePanel}>
                 <Plus className="size-4" />
-                新建表单
+                New form
               </Button>
             </CardContent>
           </Card>
@@ -425,7 +425,7 @@ export default function BaseFormsPage() {
                     <div className="min-w-0">
                       <CardTitle className="truncate">{form.name}</CardTitle>
                       <CardDescription className="mt-1">
-                        {form.tableName ?? "数据表"}
+                        {form.tableName ?? "Table"}
                       </CardDescription>
                     </div>
                     <Badge
@@ -443,19 +443,22 @@ export default function BaseFormsPage() {
                 </CardHeader>
                 <CardContent className="flex flex-1 flex-col gap-3">
                   <p className="line-clamp-2 min-h-10 text-sm text-muted-foreground">
-                    {form.description || "没有填写说明。"}
+                    {form.description || "No description yet."}
                   </p>
                   <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-                    <span>{form.submissionCount} 份回复</span>
+                    <span>
+                      {form.submissionCount}{" "}
+                      {form.submissionCount === 1 ? "response" : "responses"}
+                    </span>
                     <span>·</span>
-                    <span>更新于 {formatDate(form.updatedAt)}</span>
+                    <span>Updated {formatDate(form.updatedAt)}</span>
                   </div>
                   <div className="mt-auto flex flex-wrap items-center gap-2">
                     <Link
                       href={`/bases/${baseId}/forms/${form.id}`}
                       className={buttonVariants({ size: "sm" })}
                     >
-                      编辑表单
+                      Edit form
                     </Link>
                     {form.status === "published" ? (
                       <>
@@ -468,7 +471,7 @@ export default function BaseFormsPage() {
                             variant: "outline",
                           })}
                         >
-                          打开
+                          Open
                         </Link>
                         <Button
                           size="sm"
@@ -476,7 +479,7 @@ export default function BaseFormsPage() {
                           onClick={() => void copyLink(form.slug)}
                         >
                           <ClipboardCopy className="size-4" />
-                          复制链接
+                          Copy link
                         </Button>
                       </>
                     ) : null}
