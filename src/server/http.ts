@@ -238,10 +238,8 @@ export function isSameOriginRequest(request: Request): boolean {
 
 /**
  * Enforces the check above. Call it at the top of every cookie-authenticated
- * `POST`/`PATCH`/`PUT`/`DELETE` handler. Routes that still lack it (records,
- * tables, fields, views, forms, preferences, auth logout) must adopt the same
- * call; they are intentionally left to their owners so this slice can land
- * without touching their files.
+ * `POST`/`PATCH`/`PUT`/`DELETE` handler, and on cookie-authenticated JSON reads
+ * that carry a body (the records query route).
  */
 export function requireSameOrigin(request: Request): void {
   if (!isSameOriginRequest(request)) {

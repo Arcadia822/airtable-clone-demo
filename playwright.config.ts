@@ -36,6 +36,9 @@ export default defineConfig({
       PORT: String(PORT),
       NEXT_TELEMETRY_DISABLED: "1",
       // Local single-tenant mode: no Factory visitor auth, no Factory AI.
+      // `next start` runs with NODE_ENV=production, where auth fails closed
+      // unless this is set, so every request would otherwise answer 503.
+      ALLOW_LOCAL_WORKSPACE: "1",
       FACTORY_VISITOR_AUTH_URL: "",
       FACTORY_VISITOR_AUTH_TOKEN: "",
       FACTORY_APP_AI_URL: "",
