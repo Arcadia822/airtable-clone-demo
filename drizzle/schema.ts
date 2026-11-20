@@ -1,13 +1,23 @@
 import {
   boolean,
+  customType,
   index,
   integer,
   jsonb,
   pgTable,
+  primaryKey,
   text,
   timestamp,
   uniqueIndex,
 } from "drizzle-orm/pg-core"
+
+/**
+ * Raw binary column. Kept as `Uint8Array` (never Node `Buffer`) so the same
+ * mapping works in PGlite, node-postgres, and Workers.
+ */
+const bytea = customType<{ data: Uint8Array; driverData: Uint8Array }>({
+  dataType: () => "bytea",
+})
 
 export const bases = pgTable(
   "bases",
@@ -196,6 +206,34 @@ export const uploadSessions = pgTable("upload_sessions", {
   createdBy: text("created_by").notNull(),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 })
+
+/**
+ * One metadata row per attachment whose bytes live in `attachment_chunks`.
+ * `attachment_id` cascades with the attachment; chunks carry no FK because an
+ * upload session owns them under a temporary id until finalize promotes them.
+ */
+export const attachmentBlobs = pgTable("attachment_blobs", {
+  attachmentId: text("attachment_id")
+    .primaryKey()
+    .references(() => attachments.id, { onDelete: "cascade" }),
+  orgId: text("org_id").notNull(),
+  byteSize: integer("byte_size").notNull(),
+  chunkCount: integer("chunk_count").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+})
+
+export const attachmentChunks = pgTable(
+  "attachment_chunks",
+  {
+    attachmentId: text("attachment_id").notNull(),
+    seq: integer("seq").notNull(),
+    bytes: bytea("bytes").notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.attachmentId, table.seq] }),
+    index("attachment_chunks_attachment_idx").on(table.attachmentId),
+  ],
+)
 
 export const forms = pgTable(
   "forms",

@@ -27,6 +27,7 @@ import {
   Hash,
   Image as ImageIcon,
   Link2,
+  ListChecks,
   LoaderCircle,
   MoreHorizontal,
   Paperclip,

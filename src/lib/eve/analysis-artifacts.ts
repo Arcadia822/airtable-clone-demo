@@ -1,4 +1,3 @@
-import type { Id } from "../../../convex/_generated/dataModel"
 
 export type AssistantSourceKind =
   | "table"
@@ -8,12 +7,12 @@ export type AssistantSourceKind =
 
 export type AssistantReportSource = {
   kind: AssistantSourceKind
-  baseId: Id<"bases">
-  tableId?: Id<"tables">
-  viewId?: Id<"views">
-  formId?: Id<"forms">
-  fieldIds: Id<"fields">[]
-  recordIds: Id<"records">[]
+  baseId: string
+  tableId?: string
+  viewId?: string
+  formId?: string
+  fieldIds: string[]
+  recordIds: string[]
   queryDescriptions: string[]
 }
 
@@ -131,14 +130,12 @@ export function assistantReportSourceFromToolPart(
 
   return {
     kind: source.kind,
-    baseId: source.base.id as Id<"bases">,
-    ...(source.table
-      ? { tableId: source.table.id as Id<"tables"> }
-      : {}),
-    ...(source.view ? { viewId: source.view.id as Id<"views"> } : {}),
-    ...(source.form ? { formId: source.form.id as Id<"forms"> } : {}),
-    fieldIds: source.fields.map((field) => field.id as Id<"fields">),
-    recordIds: source.records.map((record) => record.id as Id<"records">),
+    baseId: source.base.id,
+    ...(source.table ? { tableId: source.table.id } : {}),
+    ...(source.view ? { viewId: source.view.id } : {}),
+    ...(source.form ? { formId: source.form.id } : {}),
+    fieldIds: source.fields.map((field) => field.id),
+    recordIds: source.records.map((record) => record.id),
     queryDescriptions: source.query ? [source.query.description] : [],
   }
 }

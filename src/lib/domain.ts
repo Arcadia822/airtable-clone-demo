@@ -74,6 +74,7 @@ export interface FieldConfig {
   attachmentKind?: "image" | "file" | "any"
   options?: SelectOption[]
   archivedOptions?: SelectOption[]
+  maxRating?: number
 }
 
 export interface FieldDefinition {

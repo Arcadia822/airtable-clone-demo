@@ -33,7 +33,7 @@ export function buildRecordSearchText(
       if (Array.isArray(value)) {
         for (const item of value) {
           if (typeof item === "object" && item !== null) {
-            const att = item as Partial<AttachmentValue>
+            const att = item as Partial<AttachmentValue> & { attachmentId?: string }
             if (typeof att.name === "string" && att.name.trim()) {
               parts.push(att.name)
             } else if (

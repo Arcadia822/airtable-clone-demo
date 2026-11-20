@@ -1,6 +1,5 @@
 "use client"
 
-import { useAction } from "convex/react"
 import { AlertCircle, FileQuestion, Loader2 } from "lucide-react"
 import {
   useCallback,
@@ -11,207 +10,194 @@ import {
   type ReactNode,
 } from "react"
 
-import { api } from "../../../convex/_generated/api"
-import type { Id } from "../../../convex/_generated/dataModel"
 import {
   PublicForm,
-  type PartialUploadState,
   type PublicFormSubmitResult,
 } from "@/components/forms/public-form"
 import type {
-  FieldConfig,
+  AttachmentValue,
   FieldDefinition,
-  FieldType,
-  FormConditionOperator,
-  FormConditionValue,
   FormDefinition,
+  FormTheme,
 } from "@/lib/domain"
-import {
-  createFileIdentityTracker,
-  fileIdentityEntries,
-  type FileIdentityTracker,
-} from "@/lib/file-selection"
-import {
-  indicatesPublishedFormChanged,
-  invalidatesPendingPublicSubmission,
-  publicFormAnswers,
-  publicSubmissionErrorMessage,
-} from "@/lib/public-form-data"
 import { publicFormPrefillValues } from "@/lib/form-prefill"
-import {
-  analyticsDeviceCategory,
-  analyticsTrafficSource,
-  type AnalyticsDeviceCategory,
-  type AnalyticsTrafficSource,
-} from "@/lib/form-analytics"
+import { analyticsDeviceCategory, analyticsTrafficSource } from "@/lib/form-analytics"
 
-interface PublishedField {
-  id: Id<"formVersionFields">
-  type: FieldType
-  config: FieldConfig
-  label: string
-  description?: string
-  placeholder?: string
-  required: boolean
-  mode: "visible" | "hidden"
-  fixedValue?: FormConditionValue
-  prefillParameter?: string
-  visibility?: {
-    conjunction: "and" | "or"
-    conditions: {
-      id: string
-      sourceQuestionId: Id<"formVersionFields">
-      sourceFieldId: Id<"fields">
-      operator: FormConditionOperator
-      value?: FormConditionValue
-    }[]
-  }
+export interface ConnectedPublicFormProps {
+  slug: string
+  prefillQuery?: string
 }
 
-interface PublishedForm {
+interface PublicFormPayload {
   slug: string
-  analyticsTimeZone: string
-  formVersionId: Id<"formVersions">
+  formId: string
+  versionId: string
   version: number
   title: string
   description: string
-  appearance: {
-    primaryColor: string
-    backgroundColor: string
-    submitLabel: string
-    showPoweredBy: boolean
-    layout: "card" | "plain"
-    logoUrl: string | null
-    coverUrl: string | null
-  }
-  fields: PublishedField[]
-}
-
-interface SubmissionSession {
-  submissionSessionId: Id<"publicSubmissionSessions">
-  submissionProof: string
-  expiresAt: number
-}
-
-interface UploadSession {
-  uploadSessionId: Id<"uploadSessions">
-  uploadUrl: string
-  expiresAt: number
-}
-
-interface UploadResult {
-  ok: boolean
-  attachmentId?: Id<"attachments">
-  error?: string
-}
-
-interface SubmissionResult {
-  thankYou?: {
-    title?: string
-    message?: string
+  theme: FormTheme
+  thankYou: {
+    title: string
+    message: string
     redirectUrl?: string
   }
+  settings: {
+    allowMultipleSubmissions: boolean
+    submitLabel: string
+    showPoweredBy: boolean
+  }
+  form: FormDefinition
+  fields: FieldDefinition[]
 }
 
-interface PendingSubmission {
-  session: SubmissionSession
-  idempotencyKey: string
-  attachmentIdsByFile: Map<string, Map<string, string>>
-  fileIdentityTracker: FileIdentityTracker
+type MetricName = "view" | "start"
+
+async function readPayload<T>(response: Response): Promise<T | null> {
+  return (await response.json().catch(() => null)) as T | null
 }
 
-const turnstileSiteKey = process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY
-const fallbackVisitorNonces = new Map<string, string>()
+interface UploadedAttachment extends AttachmentValue {
+  attachmentId: string
+}
 
-type PublicFormMetric =
-  | "view"
-  | "start"
-  | "validation_error"
-  | "abandonment"
+async function uploadAttachment(
+  file: File,
+  tableId: string,
+  fieldId: string,
+): Promise<UploadedAttachment> {
+  const sessionResponse = await fetch("/api/attachments/session", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ tableId, fieldId }),
+  })
+  const session = await readPayload<{
+    uploadSessionId?: string
+    uploadUrl?: string
+    message?: string
+  }>(sessionResponse)
+  if (!sessionResponse.ok || !session?.uploadSessionId || !session.uploadUrl) {
+    throw new Error(session?.message ?? `${file.name} 上传失败。`)
+  }
 
-interface PublicFormMetricContext {
-  deviceCategory?: AnalyticsDeviceCategory
-  trafficSource?: AnalyticsTrafficSource
-  lastQuestionId?: Id<"formVersionFields">
+  const separator = session.uploadUrl.includes("?") ? "&" : "?"
+  const uploadResponse = await fetch(
+    `${session.uploadUrl}${separator}name=${encodeURIComponent(file.name)}`,
+    {
+      method: "PUT",
+      headers: {
+        "content-type": file.type || "application/octet-stream",
+      },
+      body: file,
+    },
+  )
+  const upload = await readPayload<{
+    storageId?: string
+    name?: string
+    mimeType?: string
+    size?: number
+    message?: string
+  }>(uploadResponse)
+  if (!uploadResponse.ok || !upload?.storageId) {
+    throw new Error(upload?.message ?? `${file.name} 上传失败。`)
+  }
+
+  const finalizeResponse = await fetch("/api/attachments/finalize", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      uploadSessionId: session.uploadSessionId,
+      storageId: upload.storageId,
+      name: upload.name ?? file.name,
+      mimeType: upload.mimeType ?? file.type ?? "application/octet-stream",
+    }),
+  })
+  const finalized = await readPayload<{
+    attachment?: {
+      id?: string
+      attachmentId?: string
+      name?: string
+      mimeType?: string
+      size?: number
+      url?: string
+    }
+    message?: string
+  }>(finalizeResponse)
+  if (!finalizeResponse.ok) {
+    throw new Error(finalized?.message ?? `${file.name} 上传失败。`)
+  }
+  const attachment = finalized?.attachment
+  const attachmentId = attachment?.attachmentId ?? attachment?.id
+  if (!attachment || !attachmentId) {
+    throw new Error(`${file.name} 上传失败。`)
+  }
+
+  return {
+    id: attachmentId,
+    attachmentId,
+    name: attachment.name ?? file.name,
+    mimeType:
+      attachment.mimeType ?? file.type ?? "application/octet-stream",
+    size: typeof attachment.size === "number" ? attachment.size : file.size,
+    ...(attachment.url ? { url: attachment.url } : {}),
+  }
 }
 
 export function ConnectedPublicForm({
-  prefillQuery = "",
   slug,
-}: {
-  prefillQuery?: string
-  slug: string
-}) {
-  const getPublicForm = useAction(api.publicActions.getPublicForm)
-  const trackMetric = useAction(api.publicActions.trackFormMetric)
-  const beginSubmission = useAction(api.publicActions.beginPublicSubmission)
-  const createUploadSession = useAction(
-    api.publicActions.createPublicUploadSession,
-  )
-  const finalizeUpload = useAction(api.publicActions.finalizePublicUpload)
-  const submitForm = useAction(api.publicActions.submitForm)
-
-  const [published, setPublished] = useState<PublishedForm | null>()
+  prefillQuery = "",
+}: ConnectedPublicFormProps) {
+  const [payload, setPayload] = useState<PublicFormPayload | null>()
   const [loadError, setLoadError] = useState<string>()
-  const [partialUploadState, setPartialUploadState] =
-    useState<PartialUploadState>()
-  const pendingSubmissionRef = useRef<PendingSubmission | null>(null)
+  const viewedSlugRef = useRef<string | undefined>(undefined)
 
-  const recordMetric = useCallback(
+  const trackMetric = useCallback(
     (
-      form: Pick<PublishedForm, "slug" | "formVersionId">,
-      metric: PublicFormMetric,
-      context: PublicFormMetricContext = {},
+      metric: MetricName,
+      context: {
+        deviceCategory?: string
+        trafficSource?: string
+      } = {},
     ) => {
-      try {
-        const safeContext =
-          metric === "view"
-            ? {
-                ...(context.deviceCategory
-                  ? { deviceCategory: context.deviceCategory }
-                  : {}),
-                ...(context.trafficSource
-                  ? { trafficSource: context.trafficSource }
-                  : {}),
-              }
-            : metric === "abandonment"
-              ? context.lastQuestionId
-                ? { lastQuestionId: context.lastQuestionId }
-                : {}
-              : {}
-        void trackMetric({
-          slug: form.slug,
-          formVersionId: form.formVersionId,
-          metric,
-          visitorNonce: visitorNonce(form.slug),
-          ...safeContext,
-        }).catch(() => {
-          // Analytics must never block a public form.
-        })
-      } catch {
-        // Browser storage and analytics failures must never block a public form.
-      }
+      void fetch(`/api/public/forms/${encodeURIComponent(slug)}/metric`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ metric, ...context }),
+        keepalive: true,
+      }).catch(() => undefined)
     },
-    [trackMetric],
+    [slug],
   )
 
   useEffect(() => {
     let cancelled = false
-    void getPublicForm({ slug })
-      .then((result) => {
+
+    void fetch(`/api/public/forms/${encodeURIComponent(slug)}`, {
+      cache: "no-store",
+    })
+      .then(async (response) => {
+        const body = await readPayload<PublicFormPayload & { message?: string }>(
+          response,
+        )
         if (cancelled) return
-        const next = result as PublishedForm | null
-        if (next && next.slug !== slug) {
+        if (!response.ok || !body?.form) {
+          setPayload(null)
+          if (body?.message && response.status >= 500) {
+            setLoadError(body.message)
+          }
+          return
+        }
+        setPayload(body)
+        if (body.slug !== slug) {
           const query = prefillQuery ? `?${prefillQuery}` : ""
           window.history.replaceState(
             window.history.state,
             "",
-            `/f/${encodeURIComponent(next.slug)}${query}`,
+            `/f/${encodeURIComponent(body.slug)}${query}`,
           )
         }
-        setPublished(next)
-        if (next) {
-          recordMetric(next, "view", {
+        if (viewedSlugRef.current !== body.slug) {
+          viewedSlugRef.current = body.slug
+          trackMetric("view", {
             deviceCategory: analyticsDeviceCategory(window.innerWidth),
             trafficSource: analyticsTrafficSource({
               currentUrl: window.location.href,
@@ -222,54 +208,149 @@ export function ConnectedPublicForm({
       })
       .catch(() => {
         if (cancelled) return
+        setPayload(null)
         setLoadError("This form could not be loaded.")
       })
+
     return () => {
       cancelled = true
     }
-  }, [getPublicForm, prefillQuery, recordMetric, slug])
+  }, [prefillQuery, slug, trackMetric])
 
-  const form = useMemo(
-    () => (published ? toFormDefinition(published) : undefined),
-    [published],
-  )
-  const fields = useMemo(
-    () => (published ? toFieldDefinitions(published) : []),
-    [published],
-  )
   const prefillValues = useMemo(
     () =>
-      form
+      payload
         ? publicFormPrefillValues(
-            form,
-            fields,
+            payload.form,
+            payload.fields,
             new URLSearchParams(prefillQuery),
           )
         : new Map(),
-    [fields, form, prefillQuery],
+    [payload, prefillQuery],
   )
+
+  async function submit(data: FormData): Promise<PublicFormSubmitResult> {
+    if (!payload) throw new Error("This form is unavailable.")
+
+    const fieldsById = new Map(
+      payload.fields.map((field) => [field.id, field]),
+    )
+    const answers: Record<string, unknown> = {}
+
+    for (const question of payload.form.questions) {
+      const field = fieldsById.get(question.fieldId)
+      if (!field || question.mode === "hidden") continue
+
+      if (field.type === "attachment" || field.type === "image") {
+        const files = data
+          .getAll(question.id)
+          .filter(
+            (value): value is File =>
+              value instanceof File && Boolean(value.name),
+          )
+        if (!files.length) continue
+        answers[question.id] = await Promise.all(
+          files.map((file) =>
+            uploadAttachment(file, payload.form.tableId, question.fieldId),
+          ),
+        )
+        continue
+      }
+
+      if (field.type === "checkbox") {
+        answers[question.id] = data.has(question.id)
+        continue
+      }
+
+      if (field.type === "multiSelect") {
+        answers[question.id] = data
+          .getAll(question.id)
+          .filter(
+            (value): value is string =>
+              typeof value === "string" && value !== "",
+          )
+        continue
+      }
+
+      const raw = data.get(question.id)
+      if (typeof raw !== "string" || raw === "") continue
+
+      if (
+        field.type === "number" ||
+        field.type === "currency" ||
+        field.type === "percent" ||
+        field.type === "rating"
+      ) {
+        const numeric = Number(raw)
+        answers[question.id] =
+          field.type === "percent" && Number.isFinite(numeric)
+            ? numeric / 100
+            : Number.isFinite(numeric)
+              ? numeric
+              : raw
+        continue
+      }
+
+      answers[question.id] = raw
+    }
+
+    const response = await fetch(
+      `/api/public/forms/${encodeURIComponent(payload.slug)}/submit`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ answers }),
+      },
+    )
+    const body = await readPayload<{
+      submissionId?: string
+      recordId?: string
+      thankYou?: {
+        title?: string
+        message?: string
+        redirectUrl?: string
+      }
+      code?: string
+      message?: string
+    }>(response)
+
+    if (!response.ok) {
+      const error = new Error(
+        body?.message ?? "We could not save your response. Please try again.",
+      ) as Error & { code?: string }
+      if (body?.code) error.code = body.code
+      throw error
+    }
+
+    return {
+      title: body?.thankYou?.title ?? payload.thankYou.title,
+      message: body?.thankYou?.message ?? payload.thankYou.message,
+      redirectUrl:
+        body?.thankYou?.redirectUrl ?? payload.thankYou.redirectUrl,
+    }
+  }
 
   if (loadError) {
     return (
       <PublicState
         icon={<AlertCircle className="size-6" />}
         title="This form is temporarily unavailable"
-        description="The workspace could not be verified. Please try again shortly."
+        description={loadError}
       />
     )
   }
 
-  if (published === undefined) {
+  if (payload === undefined) {
     return (
       <PublicState
         icon={<Loader2 className="size-6 animate-spin" />}
         title="Loading form"
-        description="Checking the latest form…"
+        description="Checking the latest published version…"
       />
     )
   }
 
-  if (published === null) {
+  if (payload === null) {
     return (
       <PublicState
         icon={<FileQuestion className="size-6" />}
@@ -279,302 +360,27 @@ export function ConnectedPublicForm({
     )
   }
 
-  if (!form) {
-    return null
-  }
-  const formDefinition = form
-
-  if (!turnstileSiteKey) {
-    return (
-      <PublicState
-        icon={<AlertCircle className="size-6" />}
-        title="This form is temporarily unavailable"
-        description="Please let the form owner know, or try again shortly."
-      />
-    )
-  }
-
-  async function submit(data: FormData): Promise<PublicFormSubmitResult> {
-    if (!published) throw new Error("The published form is unavailable.")
-    const turnstileToken = data.get("cf-turnstile-response")
-    if (typeof turnstileToken !== "string" || !turnstileToken) {
-      throw new Error("Complete the verification before submitting.")
-    }
-
-    const attachmentCount = published.fields.reduce((count, question) => {
-      if (question.type !== "attachment") return count
-      return (
-        count +
-        data
-          .getAll(question.id)
-          .filter(
-            (value): value is File =>
-              value instanceof File && Boolean(value.name),
-          ).length
-      )
-    }, 0)
-    let uploadedAttachmentCount = 0
-    let failedFileName: string | undefined
-    let pending = pendingSubmissionRef.current
-    if (pending && pending.session.expiresAt <= Date.now()) {
-      pendingSubmissionRef.current = null
-      setPartialUploadState(undefined)
-      pending = null
-    }
-    try {
-      if (!pending) {
-        const session = (await beginSubmission({
-          slug: published.slug,
-          formVersionId: published.formVersionId,
-          turnstileToken,
-        })) as SubmissionSession
-        pending = {
-          session,
-          idempotencyKey: crypto.randomUUID(),
-          attachmentIdsByFile: new Map(),
-          fileIdentityTracker: createFileIdentityTracker(),
-        }
-        pendingSubmissionRef.current = pending
-      }
-
-      for (const question of published.fields) {
-        if (question.type !== "attachment") continue
-        const files = data
-          .getAll(question.id)
-          .filter(
-            (value): value is File =>
-              value instanceof File && Boolean(value.name),
-          )
-        const uploaded =
-          pending.attachmentIdsByFile.get(question.id) ?? new Map()
-        pending.attachmentIdsByFile.set(question.id, uploaded)
-        for (const { file, key } of fileIdentityEntries(
-          files,
-          pending.fileIdentityTracker,
-        )) {
-          if (uploaded.has(key)) {
-            uploadedAttachmentCount += 1
-            continue
-          }
-          failedFileName = file.name
-          const upload = (await createUploadSession({
-            submissionSessionId: pending.session.submissionSessionId,
-            submissionProof: pending.session.submissionProof,
-            formVersionFieldId: question.id,
-          })) as UploadSession
-          const storageId = await uploadFile(upload.uploadUrl, file)
-          const finalized = (await finalizeUpload({
-            uploadSessionId: upload.uploadSessionId,
-            storageId,
-            fileName: file.name,
-            submissionProof: pending.session.submissionProof,
-          })) as UploadResult
-          if (!finalized.ok || !finalized.attachmentId) {
-            throw new Error(
-              finalized.error ?? `${file.name} could not be finalized.`,
-            )
-          }
-          uploaded.set(key, finalized.attachmentId)
-          uploadedAttachmentCount += 1
-          failedFileName = undefined
-        }
-      }
-
-      const attachmentIds = new Map<string, string[]>()
-      for (const question of published.fields) {
-        if (question.type !== "attachment") continue
-        const files = data
-          .getAll(question.id)
-          .filter(
-            (value): value is File =>
-              value instanceof File && Boolean(value.name),
-          )
-        const uploaded = pending.attachmentIdsByFile.get(question.id)
-        attachmentIds.set(
-          question.id,
-          fileIdentityEntries(files, pending.fileIdentityTracker).flatMap(({ key }) => {
-            const attachmentId = uploaded?.get(key)
-            return attachmentId ? [attachmentId] : []
-          }),
-        )
-      }
-
-      const result = (await submitForm({
-        slug: published.slug,
-        formVersionId: published.formVersionId,
-        submissionSessionId: pending.session.submissionSessionId,
-        submissionProof: pending.session.submissionProof,
-        idempotencyKey: pending.idempotencyKey,
-        answers: publicFormAnswers(
-          formDefinition,
-          fields,
-          data,
-          attachmentIds,
-        ).map((answer) => ({
-          ...answer,
-          formVersionFieldId:
-            answer.formVersionFieldId as Id<"formVersionFields">,
-        })),
-      })) as SubmissionResult
-      pendingSubmissionRef.current = null
-      setPartialUploadState(undefined)
-
-      return {
-        title: result.thankYou?.title,
-        message: result.thankYou?.message,
-        redirectUrl: result.thankYou?.redirectUrl,
-      }
-    } catch (error) {
-      if (attachmentCount > 0 && uploadedAttachmentCount > 0) {
-        setPartialUploadState({
-          uploadedCount: uploadedAttachmentCount,
-          totalCount: attachmentCount,
-          failedFileName,
-        })
-      }
-      if (invalidatesPendingPublicSubmission(error)) {
-        pendingSubmissionRef.current = null
-        setPartialUploadState(undefined)
-        if (indicatesPublishedFormChanged(error)) {
-          void getPublicForm({ slug: published.slug })
-            .then((latest) => setPublished(latest as PublishedForm | null))
-            .catch(() => {
-              // Keep the current form visible if refreshing it also fails.
-            })
-        }
-      }
-      throw new Error(publicSubmissionErrorMessage(error))
-    }
-  }
-
   return (
     <main
-      className="min-h-dvh px-4 py-10 sm:px-6 sm:py-16"
-      style={{ background: formDefinition.theme.background }}
+      className="min-h-dvh px-4 py-8 sm:px-6 sm:py-14"
+      style={{ background: payload.theme.background }}
     >
-      <PublicForm
-        fields={fields}
-        form={formDefinition}
-        key={published.formVersionId}
-        onAbandonment={(lastQuestionId) => {
-          const lastQuestion = published.fields.find(
-            (question) => question.id === lastQuestionId,
-          )
-          recordMetric(published, "abandonment", {
-            lastQuestionId: lastQuestion?.id,
-          })
-        }}
-        onStart={() => recordMetric(published, "start")}
-        onSubmitData={submit}
-        partialUploadState={partialUploadState}
-        onFileSelectionChange={() => setPartialUploadState(undefined)}
-        onValidationError={() =>
-          recordMetric(published, "validation_error")
-        }
-        prefillValues={prefillValues}
-        turnstileSiteKey={turnstileSiteKey}
-      />
+      <div className="mx-auto w-full max-w-3xl">
+        <PublicForm
+          form={payload.form}
+          fields={payload.fields}
+          prefillValues={prefillValues}
+          onStart={() => trackMetric("start")}
+          onSubmitData={submit}
+        />
+        <p className="mt-6 text-center text-xs text-muted-foreground">
+          {payload.settings.showPoweredBy
+            ? "Powered by Basecraft"
+            : "Responses are stored securely."}
+        </p>
+      </div>
     </main>
   )
-}
-
-function toFormDefinition(published: PublishedForm): FormDefinition {
-  return {
-    id: `public:${published.slug}`,
-    baseId: "",
-    tableId: "",
-    name: published.title,
-    title: published.title,
-    description: published.description,
-    submitLabel: published.appearance.submitLabel,
-    thankYouTitle: "Thank you for your submission",
-    thankYouMessage: "Your response has been received.",
-    publicSlug: published.slug,
-    status: "published",
-    version: published.version,
-    theme: {
-      accent: published.appearance.primaryColor,
-      background: published.appearance.backgroundColor,
-      layout: published.appearance.layout ?? "card",
-      logoUrl: published.appearance.logoUrl ?? undefined,
-      coverUrl: published.appearance.coverUrl ?? undefined,
-      hideBranding: !published.appearance.showPoweredBy,
-    },
-    questions: published.fields.map((field, index) => ({
-      id: field.id,
-      fieldId: field.id,
-      label: field.label,
-      helpText: field.description ?? "",
-      placeholder: field.placeholder,
-      required: field.required,
-      mode: field.mode,
-      fixedValue: field.fixedValue,
-      prefillParameter: field.prefillParameter,
-      rank: index.toString().padStart(4, "0"),
-      visibility: field.visibility
-        ? {
-            conjunction: field.visibility.conjunction,
-            conditions: field.visibility.conditions.map((condition) => ({
-              ...condition,
-              sourceQuestionId: condition.sourceQuestionId,
-              // Public fields use their immutable version-question ID as
-              // the local field mapping. Keep the consistency guard aligned
-              // without exposing the underlying table column ID.
-              sourceFieldId: condition.sourceQuestionId,
-            })),
-          }
-        : undefined,
-    })),
-  }
-}
-
-function toFieldDefinitions(published: PublishedForm): FieldDefinition[] {
-  return published.fields.map((field, index) => ({
-    id: field.id,
-    name: field.label,
-    type: field.type,
-    config: field.config,
-    rank: index.toString().padStart(4, "0"),
-    width: 180,
-    isPrimary: false,
-  }))
-}
-
-async function uploadFile(
-  uploadUrl: string,
-  file: File,
-): Promise<Id<"_storage">> {
-  const response = await fetch(uploadUrl, {
-    method: "POST",
-    headers: {
-      "content-type": file.type || "application/octet-stream",
-    },
-    body: file,
-  })
-  if (!response.ok) {
-    throw new Error(`${file.name} could not be uploaded.`)
-  }
-  const result = (await response.json()) as { storageId?: string }
-  if (!result.storageId) {
-    throw new Error(`${file.name} returned an invalid upload response.`)
-  }
-  return result.storageId as Id<"_storage">
-}
-
-function visitorNonce(slug: string): string {
-  const key = `basecraft:form-visitor:${slug}`
-  const fallback =
-    fallbackVisitorNonces.get(key) ?? `session-${crypto.randomUUID()}`
-  fallbackVisitorNonces.set(key, fallback)
-
-  try {
-    const existing = window.sessionStorage.getItem(key)
-    if (existing) return existing
-    window.sessionStorage.setItem(key, fallback)
-  } catch {
-    // Storage may be disabled or unavailable in privacy-focused browsers.
-  }
-  return fallback
 }
 
 function PublicState({
@@ -588,7 +394,7 @@ function PublicState({
 }) {
   return (
     <main className="grid min-h-dvh place-items-center bg-muted/20 px-5">
-      <div className="max-w-md rounded-2xl border bg-background p-8 text-center shadow-sm">
+      <div className="w-full max-w-md rounded-2xl border bg-background p-8 text-center shadow-sm">
         <span className="mx-auto grid size-12 place-items-center rounded-xl bg-primary/10 text-primary">
           {icon}
         </span>

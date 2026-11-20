@@ -26,9 +26,19 @@ export const fieldTypeSchema = z.enum([
   "singleSelect",
   "multiSelect",
   "attachment",
+  "image",
+  "autoNumber",
   "createdTime",
   "createdBy",
 ]);
+
+export const selectOptionSchema = z
+  .object({
+    id: z.string().trim().min(1).max(80),
+    label: shortTextSchema,
+    color: z.string().trim().min(1).max(32).optional(),
+  })
+  .strict();
 
 export const fieldDefinitionSchema = z
   .object({
@@ -37,6 +47,7 @@ export const fieldDefinitionSchema = z
     type: fieldTypeSchema,
     revision: z.number().int().nonnegative(),
     config: z.record(z.string().max(120), jsonValueSchema).optional(),
+    options: z.array(selectOptionSchema).max(200).optional(),
   })
   .strict();
 
@@ -89,10 +100,22 @@ export const describeTableOutputSchema = z
       .object({
         id: entityIdSchema,
         name: shortTextSchema,
+        description: z.string().max(2_000).optional(),
         recordCount: z.number().int().nonnegative(),
         fields: z.array(fieldDefinitionSchema).max(100),
       })
       .strict(),
+    views: z
+      .array(
+        z
+          .object({
+            id: entityIdSchema,
+            name: shortTextSchema,
+            type: z.enum(["grid", "kanban", "timeline", "calendar", "gallery", "dashboard"]),
+          })
+          .strict(),
+      )
+      .max(30),
     source: assistantSourceSchema,
     truncated: z.boolean(),
   })
@@ -162,6 +185,7 @@ export const fieldSummarySchema = z
     populatedCount: z.number().int().nonnegative(),
     emptyCount: z.number().int().nonnegative(),
     distinctCount: z.number().int().nonnegative().optional(),
+    total: z.number().optional(),
     minimum: z.number().optional(),
     maximum: z.number().optional(),
     average: z.number().optional(),
@@ -188,7 +212,8 @@ export const summarizeTableOutputSchema = z
         z
           .object({
             group: jsonValueSchema,
-            count: z.number().int().nonnegative(),
+            label: shortTextSchema,
+            value: z.number().int().nonnegative(),
           })
           .strict(),
       )
@@ -367,6 +392,46 @@ export const deleteFieldInputSchema = z
   })
   .strict();
 
+export const createTableFieldSchema = z
+  .object({
+    name: shortTextSchema,
+    type: fieldTypeSchema,
+    config: z.record(z.string().max(120), jsonValueSchema).default({}),
+    primary: z.boolean().optional(),
+  })
+  .strict();
+
+export const createTableInputSchema = z
+  .object({
+    baseId: entityIdSchema,
+    name: shortTextSchema,
+    description: z.string().trim().max(2_000).default(""),
+    fields: z.array(createTableFieldSchema).min(1).max(40),
+    sampleRows: z.array(z.record(z.string().max(240), jsonValueSchema)).max(50).optional(),
+  })
+  .strict();
+
+export const createTableOutputSchema = z
+  .object({
+    tableId: entityIdSchema,
+    name: shortTextSchema,
+    fieldCount: z.number().int().nonnegative(),
+    recordCount: z.number().int().nonnegative(),
+    viewIds: z.array(entityIdSchema).max(6),
+    href: z.string().trim().min(1).max(1_024),
+  })
+  .strict();
+
+export const createViewInputSchema = z
+  .object({
+    baseId: entityIdSchema,
+    tableId: entityIdSchema,
+    name: shortTextSchema,
+    type: z.enum(["grid", "kanban", "timeline", "calendar", "gallery", "dashboard"]),
+    configuration: z.record(z.string().max(120), jsonValueSchema).default({}),
+  })
+  .strict();
+
 export const createFormInputSchema = z
   .object({
     baseId: entityIdSchema,
@@ -444,14 +509,98 @@ export const readOperationSchema = z.enum([
 ]);
 
 export const writeOperationSchema = z.enum([
+  "create_table",
   "create_record",
   "update_record",
   "delete_record",
   "create_field",
   "delete_field",
   "create_form",
+  "create_view",
   "update_form_settings",
 ]);
+
+export const assistantChartSchema = z
+  .object({
+    type: z.enum(["bar", "line"]),
+    title: shortTextSchema,
+    xLabel: shortTextSchema,
+    yLabel: shortTextSchema,
+    data: z
+      .array(
+        z
+          .object({
+            label: shortTextSchema,
+            value: z.number().nonnegative(),
+          })
+          .strict(),
+      )
+      .max(50),
+  })
+  .strict();
+
+export const assistantCitationSchema = z
+  .object({
+    href: z.string().trim().min(1).max(2_048),
+    kind: assistantSourceKindSchema,
+    label: shortTextSchema,
+  })
+  .strict();
+
+export const assistantDiffRowSchema = z
+  .object({
+    label: shortTextSchema,
+    after: z.string().max(1_000),
+    before: z.string().max(1_000).optional(),
+  })
+  .strict();
+
+export const assistantProposalSchema = z
+  .object({
+    operation: writeOperationSchema,
+    title: shortTextSchema,
+    summary: z.string().trim().min(1).max(1_000),
+    requiresApproval: z.literal(true),
+    diff: z.array(assistantDiffRowSchema).max(20),
+    input: z.record(z.string().max(240), jsonValueSchema),
+    warnings: z.array(z.string().trim().min(1).max(500)).max(10),
+  })
+  .strict();
+
+export const assistantStreamEventSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("delta"), text: z.string().max(8_000) }).strict(),
+  z
+    .object({
+      type: z.literal("tool_result"),
+      tool: z.string().trim().min(1).max(80),
+      data: jsonValueSchema,
+    })
+    .strict(),
+  z.object({ type: z.literal("proposal"), proposal: assistantProposalSchema }).strict(),
+  z.object({ type: z.literal("chart"), chart: assistantChartSchema }).strict(),
+  z
+    .object({
+      type: z.literal("done"),
+      requestId: entityIdSchema,
+      citations: z.array(assistantCitationSchema).max(50),
+      usage: z.record(z.string().max(40), z.number()).optional(),
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("error"),
+      code: z.string().trim().min(1).max(60),
+      message: z.string().trim().min(1).max(500),
+      retryable: z.boolean(),
+      requestId: entityIdSchema,
+    })
+    .strict(),
+]);
+
+export type AssistantChart = z.infer<typeof assistantChartSchema>;
+export type AssistantCitation = z.infer<typeof assistantCitationSchema>;
+export type AssistantProposal = z.infer<typeof assistantProposalSchema>;
+export type AssistantStreamEvent = z.infer<typeof assistantStreamEventSchema>;
 
 export const ownershipRequestSchema = z.discriminatedUnion("action", [
   z

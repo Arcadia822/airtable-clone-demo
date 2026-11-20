@@ -17,6 +17,10 @@
 /test-results/
 /playwright/.clerk/
 /playwright/.auth/
+/playwright/.cache/
+
+# local Postgres/PGlite data directories
+/.data/
 
 # next.js
 /.next/

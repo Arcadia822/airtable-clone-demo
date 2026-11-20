@@ -62,28 +62,37 @@ export function useSaveStateHealth(pendingWrites = 0, failed = false): Connectio
 
   if (!online) {
     return connectionHealth(
-      { isWebSocketConnected: false, hasEverConnected: true, hasInflightRequests: pendingWrites > 0 },
+      {
+        isWebSocketConnected: false,
+        hasEverConnected: true,
+        inflightMutations: pendingWrites,
+        connectionRetries: 0,
+        timeOfOldestInflightRequest: null,
+      },
       { online: false, pendingWrites },
     )
   }
   if (failed) {
     return {
       kind: "failed",
-      label: "Save failed",
-      description: "Your latest change could not be saved. Retry when ready.",
+      label: "Connection problem",
+      description: "We could not reconnect. Reload to try again.",
+      canStartWrite: false,
     }
   }
   if (pendingWrites > 0) {
     return {
       kind: "saving",
       label: "Saving",
-      description: `${pendingWrites} change${pendingWrites === 1 ? "" : "s"} saving…`,
+      description: "Saving your latest changes…",
+      canStartWrite: true,
     }
   }
   return {
     kind: "live",
-    label: "Saved",
+    label: "Live",
     description: "All changes are saved.",
+    canStartWrite: true,
   }
 }
 

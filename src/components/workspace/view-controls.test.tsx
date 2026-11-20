@@ -12,7 +12,7 @@ import {
   ViewControls,
   type ViewControlsField,
   type ViewControlsValue,
-} from "@/components/connected/view-controls"
+} from "@/components/workspace/view-controls"
 
 vi.stubGlobal(
   "ResizeObserver",

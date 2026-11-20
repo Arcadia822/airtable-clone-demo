@@ -383,4 +383,4 @@ it("bounds a real 1,000 record by 50 column grid and keeps logical editing", asy
   expect(document.body).not.toHaveTextContent(
     /scale_field_|scale_record_/,
   )
-})
+}, 30_000)

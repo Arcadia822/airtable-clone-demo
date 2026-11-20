@@ -222,6 +222,8 @@ export function validateCellValue(
       return value
     }
   }
+
+  throw new AppError("VALIDATION_ERROR", `${field.name} has an unsupported field type.`)
 }
 
 export function validateRecordValues(
