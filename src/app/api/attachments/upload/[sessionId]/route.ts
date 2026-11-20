@@ -1,12 +1,21 @@
 import { getDb } from "@/db/client"
-import { getServerSession } from "@/server/auth"
-import { AppError } from "@/lib/domain"
-import { jsonError, jsonOk } from "@/server/http"
+import { requireSession } from "@/server/auth"
+import {
+  clientIp,
+  enforceRateLimit,
+  jsonError,
+  jsonOk,
+  requireSameOrigin,
+} from "@/server/http"
 import { storePublicUpload, storeUpload } from "@/server/services/attachments"
 
 export const runtime = "nodejs"
 
 type Context = { params: Promise<{ sessionId: string }> }
+
+/** Uploads are heavier than the surrounding API calls, so the budget is small. */
+const PUBLIC_UPLOAD_LIMIT = 20
+const PUBLIC_UPLOAD_WINDOW_MS = 60_000
 
 async function handleUpload(request: Request, context: Context) {
   try {
@@ -15,13 +24,16 @@ async function handleUpload(request: Request, context: Context) {
     const db = await getDb()
 
     if (publicFormSlug) {
+      enforceRateLimit({
+        key: `public-upload:${clientIp(request)}:${publicFormSlug}`,
+        limit: PUBLIC_UPLOAD_LIMIT,
+        windowMs: PUBLIC_UPLOAD_WINDOW_MS,
+      })
       return jsonOk(await storePublicUpload(db, publicFormSlug, sessionId, request), 201)
     }
 
-    const session = await getServerSession(request)
-    if (!session.authenticated) {
-      throw new AppError("UNAUTHORIZED", "Authentication required.")
-    }
+    requireSameOrigin(request)
+    const session = await requireSession(request)
     return jsonOk(await storeUpload(db, session.orgId, sessionId, request), 201)
   } catch (error) {
     return jsonError(error)

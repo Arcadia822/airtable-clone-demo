@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray, sql } from "drizzle-orm"
+import { and, desc, eq, inArray, lt, sql } from "drizzle-orm"
 import { nanoid } from "nanoid"
 import { z } from "zod"
 
@@ -15,6 +15,7 @@ import {
 } from "../../../drizzle/schema"
 import type { AppDb } from "@/db/client"
 import { AppError, type AttachmentValue, type FieldConfig } from "@/lib/domain"
+import { HttpStatusError } from "@/server/http"
 
 import { requireTable } from "@/server/services/tables"
 import { createAttachmentStorage, ATTACHMENT_CHUNK_SIZE } from "@/server/storage"
@@ -49,6 +50,112 @@ export function attachmentValueFromRow(row: AttachmentRow): ResolvedAttachment {
   }
 }
 
+/** Raster images that are safe to render inline in a browser. */
+const RASTER_IMAGE_MIME_TYPES: Record<string, true> = {
+  "image/png": true,
+  "image/jpeg": true,
+  "image/gif": true,
+  "image/webp": true,
+  "image/avif": true,
+}
+
+/**
+ * Types an attachment row may store. SVG is deliberately absent: it is
+ * scriptable XML, so it can never be served inline and has no product use here.
+ */
+const ALLOWED_MIME_TYPES: Record<string, true> = {
+  ...RASTER_IMAGE_MIME_TYPES,
+  "application/pdf": true,
+  "text/plain": true,
+  "text/csv": true,
+  "application/json": true,
+  "application/zip": true,
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": true,
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document": true,
+}
+
+const EXTENSION_BY_MIME: Record<string, string> = {
+  "image/png": ".png",
+  "image/jpeg": ".jpg",
+  "image/gif": ".gif",
+  "image/webp": ".webp",
+  "image/avif": ".avif",
+  "application/pdf": ".pdf",
+  "text/csv": ".csv",
+  "text/plain": ".txt",
+  "application/json": ".json",
+  "application/zip": ".zip",
+}
+
+const SAFE_IMAGE_MESSAGE =
+  "This column only accepts PNG, JPEG, GIF, WebP, or AVIF images."
+
+export function isRasterImageMimeType(mimeType: string): boolean {
+  return RASTER_IMAGE_MIME_TYPES[mimeType.trim().toLowerCase()] === true
+}
+
+/** True when the type may be rendered in the browser instead of downloaded. */
+export function isInlineSafeMimeType(mimeType: string): boolean {
+  return isRasterImageMimeType(mimeType)
+}
+
+function normalizeMimeType(raw: string | null | undefined): string | undefined {
+  const value = raw?.split(";")[0]?.trim().toLowerCase()
+  return value || undefined
+}
+
+function bytesAscii(bytes: Uint8Array, start: number, length: number): string {
+  const end = Math.min(bytes.byteLength, start + length)
+  let text = ""
+  for (let index = start; index < end; index += 1) {
+    text += String.fromCharCode(bytes[index])
+  }
+  return text
+}
+
+function startsWithBytes(bytes: Uint8Array, signature: readonly number[]): boolean {
+  if (bytes.byteLength < signature.length) return false
+  return signature.every((byte, index) => bytes[index] === byte)
+}
+
+/**
+ * Identifies content from its leading bytes. A recognized signature is
+ * authoritative; the client-declared type is only ever a hint.
+ */
+export function sniffMimeType(bytes: Uint8Array): string | undefined {
+  if (startsWithBytes(bytes, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) {
+    return "image/png"
+  }
+  if (startsWithBytes(bytes, [0xff, 0xd8, 0xff])) return "image/jpeg"
+  if (startsWithBytes(bytes, [0x47, 0x49, 0x46, 0x38])) return "image/gif"
+  if (bytesAscii(bytes, 0, 4) === "RIFF" && bytesAscii(bytes, 8, 4) === "WEBP") {
+    return "image/webp"
+  }
+  if (bytesAscii(bytes, 4, 4) === "ftyp") {
+    const brand = bytesAscii(bytes, 8, 4)
+    if (brand === "avif" || brand === "avis") return "image/avif"
+  }
+  if (bytesAscii(bytes, 0, 5) === "%PDF-") return "application/pdf"
+  if (startsWithBytes(bytes, [0x50, 0x4b, 0x03, 0x04])) return "application/zip"
+
+  const head = bytesAscii(bytes, 0, 256)
+    .replace(/^\uFEFF/, "")
+    .trimStart()
+    .toLowerCase()
+  if (
+    head.startsWith("<svg") ||
+    head.startsWith("<?xml") ||
+    head.startsWith("<!doctype html") ||
+    head.startsWith("<html") ||
+    head.startsWith("<script") ||
+    head.startsWith("<iframe")
+  ) {
+    // Active content: XML/SVG/HTML can run script when a browser renders it.
+    return "text/html"
+  }
+  return undefined
+}
+
 function mimeFromExtension(name: string): string | undefined {
   const extension = /\.([A-Za-z0-9]{1,10})$/.exec(name)?.[1]?.toLowerCase()
   if (!extension) return undefined
@@ -59,7 +166,6 @@ function mimeFromExtension(name: string): string | undefined {
     gif: "image/gif",
     webp: "image/webp",
     avif: "image/avif",
-    svg: "image/svg+xml",
     pdf: "application/pdf",
     csv: "text/csv",
     txt: "text/plain",
@@ -71,18 +177,40 @@ function mimeFromExtension(name: string): string | undefined {
   return table[extension]
 }
 
-const EXTENSION_BY_MIME: Record<string, string> = {
-  "image/png": ".png",
-  "image/jpeg": ".jpg",
-  "image/gif": ".gif",
-  "image/webp": ".webp",
-  "image/avif": ".avif",
-  "image/svg+xml": ".svg",
-  "application/pdf": ".pdf",
-  "text/csv": ".csv",
-  "text/plain": ".txt",
-  "application/json": ".json",
-  "application/zip": ".zip",
+/**
+ * Server-authoritative MIME type for an upload.
+ *
+ * 1. Active content (SVG/HTML/XML) is rejected outright.
+ * 2. A recognized raster/PDF/ZIP signature wins over the declared type.
+ * 3. Otherwise the declared type or file extension is used, but only when it
+ *    is on the allowlist. Anything else is stored and served as
+ *    `application/octet-stream`, always as a download with `nosniff`.
+ */
+export function resolveUploadMimeType(
+  bytes: Uint8Array,
+  declaredMimeType: string | null | undefined,
+  fileName: string,
+): string {
+  const sniffed = sniffMimeType(bytes)
+  if (sniffed === "text/html") {
+    throw new AppError(
+      "VALIDATION_ERROR",
+      "SVG, HTML, and XML files are not supported. Upload an image, PDF, or document instead.",
+    )
+  }
+  if (sniffed && isRasterImageMimeType(sniffed)) return sniffed
+  if (sniffed === "application/pdf") return "application/pdf"
+  if (sniffed === "application/zip") {
+    const byName = mimeFromExtension(fileName)
+    if (byName && ALLOWED_MIME_TYPES[byName] === true) return byName
+    return "application/zip"
+  }
+
+  const declared = normalizeMimeType(declaredMimeType)
+  if (declared && ALLOWED_MIME_TYPES[declared] === true) return declared
+  const byExtension = mimeFromExtension(fileName)
+  if (byExtension && ALLOWED_MIME_TYPES[byExtension] === true) return byExtension
+  return "application/octet-stream"
 }
 
 function sanitizeFileName(raw: string): string {
@@ -150,6 +278,8 @@ export async function createUploadSession(
 ): Promise<UploadSessionJson> {
   const input = createUploadSessionInputSchema.parse(rawInput)
   await requireTable(db, orgId, input.tableId)
+  // Opportunistic cleanup so abandoned sessions do not keep their bytes.
+  await purgeExpiredUploadSessions(db, orgId).catch(() => undefined)
   if (input.recordId) {
     const [record] = await db
       .select({ id: recordsTable.id })
@@ -286,6 +416,7 @@ export async function createPublicUploadSession(
   rawInput: unknown,
 ): Promise<UploadSessionJson> {
   const form = await resolvePublishedForm(db, rawSlug)
+  await purgeExpiredUploadSessions(db, form.orgId).catch(() => undefined)
   const input = createPublicUploadSessionInputSchema.parse(rawInput)
   if (input.tableId && input.tableId !== form.tableId) {
     throw new AppError("NOT_FOUND", "Published form not found.")
@@ -352,12 +483,141 @@ async function loadSession(db: AppDb, orgId: string, sessionId: string) {
     .limit(1)
   if (!session) throw new AppError("NOT_FOUND", "Upload session not found.")
   if (session.consumedAt) {
-    throw new AppError("VALIDATION_ERROR", "Upload session was already finalized.")
+    throw new HttpStatusError(
+      "UPLOAD_SESSION_CONSUMED",
+      "This upload session was already used. Start a new upload.",
+      409,
+    )
   }
   if (session.expiresAt.getTime() < Date.now()) {
-    throw new AppError("VALIDATION_ERROR", "Upload session expired.")
+    await discardSessionBytes(db, [session.id]).catch(() => undefined)
+    throw new HttpStatusError(
+      "UPLOAD_SESSION_EXPIRED",
+      "This upload session expired. Start a new upload.",
+      409,
+    )
   }
   return session
+}
+
+/**
+ * Storage keys a session wrote before finalize. Chunks are keyed by
+ * `<sessionId>/<random><ext>` until finalize promotes them. The range
+ * predicates let the `(attachment_id, seq)` primary key answer the lookup; the
+ * exact `left(...)` comparison is what actually authorizes the match, because
+ * `LIKE` would treat the `_` in `ups_…` as a wildcard.
+ */
+async function sessionStorageIds(db: AppDb, sessionId: string): Promise<string[]> {
+  const prefix = `${sessionId}/`
+  // `/` sorts before `0` in both C and ICU collations, so this upper bound
+  // covers every key in the session without reaching the next session id.
+  const upperBound = `${sessionId}0`
+  const rows = await db
+    .selectDistinct({ id: attachmentChunksTable.attachmentId })
+    .from(attachmentChunksTable)
+    .where(
+      and(
+        sql`${attachmentChunksTable.attachmentId} >= ${prefix}`,
+        sql`${attachmentChunksTable.attachmentId} < ${upperBound}`,
+        sql`left(${attachmentChunksTable.attachmentId}, ${prefix.length}) = ${prefix}`,
+      ),
+    )
+  return rows.map((row) => row.id)
+}
+
+/** Drops the bytes a session wrote. Used on failure, expiry, and finalize errors. */
+async function discardSessionBytes(
+  db: AppDb,
+  sessionIds: readonly string[],
+): Promise<void> {
+  if (!sessionIds.length) return
+  const storage = await createAttachmentStorage(db)
+  for (const sessionId of sessionIds) {
+    for (const storageId of await sessionStorageIds(db, sessionId)) {
+      await storage.remove(storageId).catch(() => undefined)
+    }
+  }
+}
+
+/**
+ * Deletes expired upload sessions and the bytes they left behind. Called
+ * opportunistically when a session is created so abandoned uploads cannot
+ * accumulate in storage without a scheduled job.
+ */
+export async function purgeExpiredUploadSessions(
+  db: AppDb,
+  orgId?: string,
+): Promise<number> {
+  const expired = await db
+    .select({ id: uploadSessions.id })
+    .from(uploadSessions)
+    .where(
+      and(
+        orgId ? eq(uploadSessions.orgId, orgId) : undefined,
+        lt(uploadSessions.expiresAt, new Date()),
+      ),
+    )
+  if (!expired.length) return 0
+  const ids = expired.map((row) => row.id)
+  await discardSessionBytes(db, ids)
+  await db.delete(uploadSessions).where(inArray(uploadSessions.id, ids))
+  return ids.length
+}
+
+function tooLargeError(actualBytes?: number): AppError {
+  return new AppError(
+    "VALIDATION_ERROR",
+    `Files must be ${(MAX_FILE_BYTES / (1024 * 1024)).toLocaleString()}MB or smaller.`,
+    { maxBytes: MAX_FILE_BYTES, ...(actualBytes ? { actualBytes } : {}) },
+  )
+}
+
+/** Room for multipart boundaries and headers on top of the file itself. */
+const MULTIPART_OVERHEAD_BYTES = 64 * 1024
+
+function declaredContentLength(request: Request): number | undefined {
+  const raw = request.headers.get("content-length")
+  if (!raw) return undefined
+  const value = Number(raw)
+  return Number.isFinite(value) && value >= 0 ? value : undefined
+}
+
+/** Reads the body while counting bytes, cancelling the stream past `limit`. */
+async function readBodyWithinLimit(
+  request: Request,
+  limit: number,
+): Promise<Uint8Array> {
+  if (!request.body) return new Uint8Array(0)
+  const reader = request.body.getReader()
+  const parts: Uint8Array[] = []
+  let total = 0
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      if (!value) continue
+      total += value.byteLength
+      if (total > limit) {
+        await reader.cancel().catch(() => undefined)
+        throw tooLargeError(total)
+      }
+      parts.push(value)
+    }
+  } finally {
+    try {
+      reader.releaseLock()
+    } catch {
+      // The stream was already released by cancel().
+    }
+  }
+
+  const bytes = new Uint8Array(total)
+  let offset = 0
+  for (const part of parts) {
+    bytes.set(part, offset)
+    offset += part.byteLength
+  }
+  return bytes
 }
 
 async function readUploadBody(request: Request): Promise<{
@@ -367,8 +627,26 @@ async function readUploadBody(request: Request): Promise<{
 }> {
   const contentType = request.headers.get("content-type") ?? ""
   const url = new URL(request.url)
+  const length = declaredContentLength(request)
+  const multipart = contentType.toLowerCase().includes("multipart/form-data")
 
-  if (contentType.toLowerCase().includes("multipart/form-data")) {
+  // Reject an oversized body before reading a single byte.
+  if (
+    length !== undefined &&
+    length > MAX_FILE_BYTES + (multipart ? MULTIPART_OVERHEAD_BYTES : 0)
+  ) {
+    throw tooLargeError(length)
+  }
+
+  if (multipart) {
+    // `formData()` buffers the whole body, so a chunked multipart upload is
+    // refused rather than risking unbounded memory.
+    if (length === undefined) {
+      throw new AppError(
+        "VALIDATION_ERROR",
+        "Multipart uploads must declare a Content-Length header.",
+      )
+    }
     const form = await request.formData().catch(() => null)
     if (!form) throw new AppError("VALIDATION_ERROR", "Malformed multipart upload.")
     let file: File | null = null
@@ -379,17 +657,18 @@ async function readUploadBody(request: Request): Promise<{
       }
     }
     if (!file) throw new AppError("VALIDATION_ERROR", "No file was uploaded.")
+    if (file.size > MAX_FILE_BYTES) throw tooLargeError(file.size)
     return {
       bytes: new Uint8Array(await file.arrayBuffer()),
-      mimeType: file.type || "application/octet-stream",
+      mimeType: normalizeMimeType(file.type) ?? "application/octet-stream",
       name: file.name || url.searchParams.get("name") || "upload",
     }
   }
 
-  const bytes = new Uint8Array(await request.arrayBuffer())
+  const bytes = await readBodyWithinLimit(request, MAX_FILE_BYTES)
   return {
     bytes,
-    mimeType: contentType.split(";")[0]?.trim() || "application/octet-stream",
+    mimeType: normalizeMimeType(contentType) ?? "application/octet-stream",
     name:
       url.searchParams.get("name") ??
       request.headers.get("x-file-name") ??
@@ -409,7 +688,18 @@ async function storeUploadForSession(
   session: typeof uploadSessions.$inferSelect,
   request: Request,
 ): Promise<StoredUpload> {
-  const { bytes, mimeType, name } = await readUploadBody(request)
+  // Single-use session: a successful write leaves chunks under the session id,
+  // and the session row itself is only consumed at finalize. Refusing here
+  // keeps a retry after a *failed* write possible without a schema change.
+  if ((await sessionStorageIds(db, session.id)).length > 0) {
+    throw new HttpStatusError(
+      "UPLOAD_SESSION_CONSUMED",
+      "This upload session already received a file. Start a new upload.",
+      409,
+    )
+  }
+
+  const { bytes, mimeType: declaredMime, name } = await readUploadBody(request)
 
   if (bytes.byteLength === 0) {
     throw new AppError("VALIDATION_ERROR", "Uploaded file is empty.", {
@@ -417,13 +707,10 @@ async function storeUploadForSession(
     })
   }
   if (bytes.byteLength > MAX_FILE_BYTES) {
-    throw new AppError(
-      "VALIDATION_ERROR",
-      `Files must be ${(MAX_FILE_BYTES / (1024 * 1024)).toLocaleString()}MB or smaller.`,
-      { maxBytes: MAX_FILE_BYTES, actualBytes: bytes.byteLength },
-    )
+    throw tooLargeError(bytes.byteLength)
   }
 
+  const mimeType = resolveUploadMimeType(bytes, declaredMime, name)
   const fieldKind = await attachmentKindForField(
     db,
     session.orgId,
@@ -434,20 +721,24 @@ async function storeUploadForSession(
   const kind: AttachmentKind =
     fieldKind === "image" || requestedKind === "image" ? "image" : "any"
 
-  if (kind === "image" && !mimeType.toLowerCase().startsWith("image/")) {
-    throw new AppError("VALIDATION_ERROR", "This column only accepts image files.", {
-      mimeType,
-    })
+  if (kind === "image" && !isRasterImageMimeType(mimeType)) {
+    throw new AppError("VALIDATION_ERROR", SAFE_IMAGE_MESSAGE, { mimeType })
   }
 
   const storageId = `${session.id}/${nanoid(16)}${extensionFor(name, mimeType)}`
   const storage = await createAttachmentStorage(db)
-  await storage.putChunks(
-    storageId,
-    session.orgId,
-    byteParts(bytes),
-    bytes.byteLength,
-  )
+  try {
+    await storage.putChunks(
+      storageId,
+      session.orgId,
+      byteParts(bytes),
+      bytes.byteLength,
+    )
+  } catch (error) {
+    // A partial write must not linger under the session key.
+    await storage.remove(storageId).catch(() => undefined)
+    throw error
+  }
 
   return {
     storageId,
@@ -501,6 +792,21 @@ async function finalizeUploadSession(
   if (!input.storageId.startsWith(`${session.id}/`)) {
     throw new AppError("VALIDATION_ERROR", "Upload does not belong to this session.")
   }
+  try {
+    return await persistFinalizedUpload(db, session, userId, input)
+  } catch (error) {
+    // The session is unusable after a failed finalize, so drop its bytes.
+    await discardSessionBytes(db, [session.id]).catch(() => undefined)
+    throw error
+  }
+}
+
+async function persistFinalizedUpload(
+  db: AppDb,
+  session: typeof uploadSessions.$inferSelect,
+  userId: string | null,
+  input: { uploadSessionId: string; storageId: string; name?: string; mimeType?: string },
+): Promise<{ ok: true; attachment: ResolvedAttachment }> {
   const [stats] = await db
     .select({
       chunkCount: sql<number>`count(*)::int`,
@@ -515,16 +821,22 @@ async function finalizeUploadSession(
   const name = sanitizeFileName(
     input.name ?? input.storageId.slice(input.storageId.lastIndexOf("/") + 1),
   )
-  const mimeType =
-    input.mimeType ?? mimeFromExtension(name) ?? "application/octet-stream"
+  // Re-sniff on finalize: the client-supplied name and type are hints only, so
+  // a row can never be stored as SVG/HTML even if finalize is called directly.
+  const leading = await readLeadingChunkBytes(db, input.storageId)
+  const mimeType = resolveUploadMimeType(
+    leading,
+    normalizeMimeType(input.mimeType) ?? mimeFromExtension(name),
+    name,
+  )
   const fieldKind = await attachmentKindForField(
     db,
     session.orgId,
     session.tableId,
     session.fieldId,
   )
-  if (fieldKind === "image" && !mimeType.toLowerCase().startsWith("image/")) {
-    throw new AppError("VALIDATION_ERROR", "This column only accepts image files.")
+  if (fieldKind === "image" && !isRasterImageMimeType(mimeType)) {
+    throw new AppError("VALIDATION_ERROR", SAFE_IMAGE_MESSAGE, { mimeType })
   }
 
   const attachmentId = `att_${nanoid(12)}`
@@ -579,6 +891,29 @@ async function finalizeUploadSession(
 
   if (!row) throw new AppError("VALIDATION_ERROR", "Upload could not be finalized.")
   return { ok: true, attachment: attachmentValueFromRow(row) }
+}
+
+/** Leading bytes of an uploaded file, used to re-derive its type at finalize. */
+async function readLeadingChunkBytes(
+  db: AppDb,
+  storageId: string,
+): Promise<Uint8Array> {
+  const [row] = await db
+    .select({ bytes: attachmentChunksTable.bytes })
+    .from(attachmentChunksTable)
+    .where(
+      and(
+        eq(attachmentChunksTable.attachmentId, storageId),
+        eq(attachmentChunksTable.seq, 0),
+      ),
+    )
+    .limit(1)
+  if (!row) return new Uint8Array(0)
+  const bytes =
+    row.bytes instanceof Uint8Array
+      ? row.bytes
+      : new Uint8Array(row.bytes as ArrayBuffer)
+  return bytes.subarray(0, Math.min(bytes.byteLength, 512))
 }
 
 export async function finalizeAttachment(
@@ -681,18 +1016,57 @@ export async function resolveAttachmentDownload(
     )
     .limit(1)
   if (!row) throw new AppError("NOT_FOUND", "Attachment not found.")
+  if (viewerOrgId === row.orgId) return { row }
 
-  if (viewerOrgId !== row.orgId) {
-    const [publishedForm] = await db
-      .select({ id: formsTable.id })
-      .from(formsTable)
-      .where(
-        and(eq(formsTable.tableId, row.tableId), eq(formsTable.status, "published")),
-      )
-      .limit(1)
-    if (!publishedForm) {
-      throw new AppError("NOT_FOUND", "Attachment not found.")
-    }
+  // A signed-in identity never inherits the anonymous grant: only
+  // organization members and truly anonymous respondents may read at all.
+  if (viewerOrgId !== undefined) {
+    throw new AppError("NOT_FOUND", "Attachment not found.")
+  }
+
+  // Anonymous reads are limited to files an anonymous respondent uploaded
+  // through a currently published form that still asks for that exact column.
+  if (row.createdBy !== PUBLIC_UPLOAD_CREATED_BY || !row.fieldId) {
+    throw new AppError("NOT_FOUND", "Attachment not found.")
+  }
+
+  const publishedVersions = await db
+    .select({ versionId: formVersions.id })
+    .from(formsTable)
+    .innerJoin(
+      formVersions,
+      and(
+        eq(formVersions.id, formsTable.publishedVersionId),
+        eq(formVersions.orgId, formsTable.orgId),
+      ),
+    )
+    .where(
+      and(
+        eq(formsTable.orgId, row.orgId),
+        eq(formsTable.tableId, row.tableId),
+        eq(formsTable.status, "published"),
+      ),
+    )
+  if (!publishedVersions.length) {
+    throw new AppError("NOT_FOUND", "Attachment not found.")
+  }
+
+  const [publishedField] = await db
+    .select({ id: formVersionFields.id })
+    .from(formVersionFields)
+    .where(
+      and(
+        eq(formVersionFields.orgId, row.orgId),
+        inArray(
+          formVersionFields.formVersionId,
+          publishedVersions.map((version) => version.versionId),
+        ),
+        eq(formVersionFields.targetFieldId, row.fieldId),
+      ),
+    )
+    .limit(1)
+  if (!publishedField) {
+    throw new AppError("NOT_FOUND", "Attachment not found.")
   }
 
   return { row }

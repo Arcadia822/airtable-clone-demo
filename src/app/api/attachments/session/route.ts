@@ -1,13 +1,22 @@
 import { getDb } from "@/db/client"
-import { getServerSession } from "@/server/auth"
-import { AppError } from "@/lib/domain"
-import { jsonError, jsonOk } from "@/server/http"
+import { requireSession } from "@/server/auth"
+import {
+  clientIp,
+  enforceRateLimit,
+  jsonError,
+  jsonOk,
+  requireSameOrigin,
+} from "@/server/http"
 import {
   createPublicUploadSession,
   createUploadSession,
 } from "@/server/services/attachments"
 
 export const runtime = "nodejs"
+
+/** Anonymous respondents get a small upload budget per IP and form. */
+const PUBLIC_SESSION_LIMIT = 20
+const PUBLIC_SESSION_WINDOW_MS = 60_000
 
 export async function POST(request: Request) {
   try {
@@ -22,13 +31,16 @@ export async function POST(request: Request) {
 
     const db = await getDb()
     if (publicFormSlug) {
+      enforceRateLimit({
+        key: `public-upload-session:${clientIp(request)}:${publicFormSlug}`,
+        limit: PUBLIC_SESSION_LIMIT,
+        windowMs: PUBLIC_SESSION_WINDOW_MS,
+      })
       return jsonOk(await createPublicUploadSession(db, publicFormSlug, body), 201)
     }
 
-    const session = await getServerSession(request)
-    if (!session.authenticated) {
-      throw new AppError("UNAUTHORIZED", "Authentication required.")
-    }
+    requireSameOrigin(request)
+    const session = await requireSession(request)
     return jsonOk(
       await createUploadSession(db, session.orgId, session.userId, body),
       201,

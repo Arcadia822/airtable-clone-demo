@@ -1,7 +1,10 @@
 import { getDb } from "@/db/client"
 import { getServerSession } from "@/server/auth"
 import { jsonError } from "@/server/http"
-import { resolveAttachmentDownload } from "@/server/services/attachments"
+import {
+  isInlineSafeMimeType,
+  resolveAttachmentDownload,
+} from "@/server/services/attachments"
 import { createAttachmentStorage } from "@/server/storage"
 
 export const runtime = "nodejs"
@@ -19,8 +22,10 @@ function disposition(kind: "inline" | "attachment", name: string): string {
 
 /**
  * Serves stored attachment bytes from the configured storage adapter.
- * Organization members always pass; otherwise a published form for the
- * attachment's table grants public read access.
+ *
+ * Only raster images are rendered inline; every other type is served as an
+ * opaque download. `nosniff` and a sandboxing CSP mean a mislabelled file can
+ * never execute in the app's origin even if it reaches a browser.
  */
 export async function GET(request: Request, context: Context) {
   try {
@@ -32,15 +37,20 @@ export async function GET(request: Request, context: Context) {
 
     const storage = await createAttachmentStorage(db)
     const stored = await storage.read(attachmentId)
-    const inline = row.mimeType.toLowerCase().startsWith("image/")
+    const inline = isInlineSafeMimeType(row.mimeType)
 
     return new Response(stored.stream, {
       status: 200,
       headers: {
-        "Content-Type": row.mimeType,
+        "Content-Type": inline ? row.mimeType : "application/octet-stream",
         "Content-Length": String(stored.size),
         "Cache-Control": "private, max-age=3600",
-        "Content-Disposition": disposition(inline ? "inline" : "attachment", row.name),
+        "Content-Disposition": disposition(
+          inline ? "inline" : "attachment",
+          row.name,
+        ),
+        "X-Content-Type-Options": "nosniff",
+        "Content-Security-Policy": "sandbox; default-src 'none'",
       },
     })
   } catch (error) {

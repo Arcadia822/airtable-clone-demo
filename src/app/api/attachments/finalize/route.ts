@@ -1,13 +1,21 @@
 import { getDb } from "@/db/client"
-import { getServerSession } from "@/server/auth"
-import { AppError } from "@/lib/domain"
-import { jsonError, jsonOk } from "@/server/http"
+import { requireSession } from "@/server/auth"
+import {
+  clientIp,
+  enforceRateLimit,
+  jsonError,
+  jsonOk,
+  requireSameOrigin,
+} from "@/server/http"
 import {
   finalizeAttachment,
   finalizePublicAttachment,
 } from "@/server/services/attachments"
 
 export const runtime = "nodejs"
+
+const PUBLIC_FINALIZE_LIMIT = 20
+const PUBLIC_FINALIZE_WINDOW_MS = 60_000
 
 export async function POST(request: Request) {
   try {
@@ -22,13 +30,16 @@ export async function POST(request: Request) {
 
     const db = await getDb()
     if (publicFormSlug) {
+      enforceRateLimit({
+        key: `public-finalize:${clientIp(request)}:${publicFormSlug}`,
+        limit: PUBLIC_FINALIZE_LIMIT,
+        windowMs: PUBLIC_FINALIZE_WINDOW_MS,
+      })
       return jsonOk(await finalizePublicAttachment(db, publicFormSlug, body), 201)
     }
 
-    const session = await getServerSession(request)
-    if (!session.authenticated) {
-      throw new AppError("UNAUTHORIZED", "Authentication required.")
-    }
+    requireSameOrigin(request)
+    const session = await requireSession(request)
     return jsonOk(
       await finalizeAttachment(db, session.orgId, session.userId, body),
       201,
