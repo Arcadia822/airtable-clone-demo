@@ -478,4 +478,97 @@ describe("useTableData mutations", () => {
     ])
     expect(result.current.records[0]?.revision).toBe(10)
   })
+
+  it("guards an upload on the revision it read instead of a newer local one", async () => {
+    const existing = {
+      id: "attachment_existing",
+      name: "existing.png",
+      mimeType: "image/png",
+      size: 10,
+      url: "https://example.test/existing.png",
+    }
+    const record = makeRecord(
+      "record_atlas",
+      { field_name: "Atlas", field_cover: [existing] },
+      4,
+    )
+    // The read the upload merges against was served before the queued rename
+    // landed, so the server snapshot is still at revision 4.
+    const snapshot = makeRecord(
+      "record_atlas",
+      { field_name: "Atlas", field_cover: [existing] },
+      4,
+    )
+    let batchCalls = 0
+    let queryCalls = 0
+    const mock = fetchMock((call) => {
+      if (call.url.endsWith("/records/query")) {
+        queryCalls += 1
+        return jsonResponse(queryResponse([record]))
+      }
+      if (call.url.endsWith("/api/attachments/session")) {
+        return jsonResponse({
+          uploadSessionId: "session_1",
+          uploadUrl: "/api/attachments/upload/session_1",
+        })
+      }
+      if (call.url.endsWith("/api/attachments/upload/session_1")) {
+        return jsonResponse({
+          storageId: "storage_1",
+          name: "chart.png",
+          mimeType: "image/png",
+        })
+      }
+      if (call.url.endsWith("/api/attachments/finalize")) {
+        return jsonResponse({
+          attachment: {
+            id: "attachment_new",
+            attachmentId: "attachment_new",
+            name: "chart.png",
+            mimeType: "image/png",
+            size: 12,
+            url: "/api/files/attachment_new",
+          },
+        })
+      }
+      if (call.method === "GET" && call.url.endsWith("/api/records/record_atlas")) {
+        return jsonResponse({ record: snapshot })
+      }
+      if (call.url.endsWith("/records/batch")) {
+        batchCalls += 1
+        return batchCalls === 1
+          ? jsonResponse({ revisions: { record_atlas: 5 } })
+          : jsonResponse(
+              {
+                code: "REVISION_CONFLICT",
+                message: "This record was updated by someone else.",
+              },
+              409,
+            )
+      }
+      return jsonResponse(bundle)
+    })
+    const { result } = await renderTable(mock)
+
+    await act(async () => {
+      await result.current.updateCell(record.id, nameField.id, "Atlas renamed", 4)
+      await result.current.uploadAttachments(
+        { recordId: record.id, fieldId: coverField.id },
+        [new File(["chart"], "chart.png", { type: "image/png" })],
+      )
+    })
+
+    const bodies = readBodies(recordedCalls(mock), "/records/batch") as Array<{
+      updates: Array<{ expectedRevision: number; exactRevision?: boolean }>
+    }>
+    expect(bodies).toHaveLength(2)
+    // Revision 5 is already known locally, but the merged cell came from the
+    // revision-4 read: the guard must stay at 4 so the race is reported.
+    expect(bodies[1]!.updates[0]!.expectedRevision).toBe(4)
+    expect(bodies[1]!.updates[0]).not.toHaveProperty("exactRevision")
+    expect(result.current.error).toBe("This record was updated by someone else.")
+    // The conflict refreshed the grid instead of overwriting the other edit.
+    expect(queryCalls).toBe(2)
+    expect(result.current.records[0]?.values[coverField.id]).toEqual([existing])
+  })
 })

@@ -1,3 +1,7 @@
+import { readFile } from "node:fs/promises"
+import path from "node:path"
+
+import { PGlite } from "@electric-sql/pglite"
 import { afterEach, beforeEach, describe, expect, it } from "vitest"
 
 import { asc, eq } from "drizzle-orm"
@@ -21,6 +25,7 @@ import {
 import { POST as recordsQueryPOST } from "@/app/api/tables/[tableId]/records/query/route"
 import { PATCH as recordsBatchPATCH } from "@/app/api/tables/[tableId]/records/batch/route"
 import {
+  DELETE as recordDELETE,
   GET as recordGET,
   PATCH as recordPATCH,
 } from "@/app/api/records/[recordId]/route"
@@ -175,6 +180,71 @@ describe("optimistic concurrency", () => {
     const stored = await fetchRecord(record.id)
     expect(stored.revision).toBe(2)
     expect([1, 2]).toContain(stored.values[priority.id])
+  })
+
+  it("still guards a write that sends no expected revision", async () => {
+    const { table, fieldByName } = await seededWorkspace()
+    const title = fieldByName("Project Name")
+    const priority = fieldByName("Priority")
+    const record = await createRecord(table.id, { [title.id]: "Unguarded race" })
+
+    const [guarded, unguarded] = await Promise.all([
+      recordPATCH(
+        jsonRequest(`/api/records/${record.id}`, "PATCH", {
+          values: { [priority.id]: 1 },
+          expectedRevision: record.revision,
+        }),
+        routeContext({ recordId: record.id }),
+      ),
+      recordPATCH(
+        jsonRequest(`/api/records/${record.id}`, "PATCH", {
+          values: { [title.id]: "Renamed without a revision" },
+        }),
+        routeContext({ recordId: record.id }),
+      ),
+    ])
+
+    expect([guarded.status, unguarded.status].sort()).toEqual([200, 409])
+    const stale = guarded.status === 409 ? guarded : unguarded
+    const conflict = await readJson<{
+      code: string
+      details: { recordId: string; expectedRevision: number; actualRevision: number }
+    }>(stale)
+    expect(conflict.code).toBe("REVISION_CONFLICT")
+    expect(conflict.details).toMatchObject({
+      recordId: record.id,
+      expectedRevision: record.revision,
+      actualRevision: record.revision + 1,
+    })
+
+    // Exactly one write landed, and it bumped the revision once: the stale
+    // writer's cell was never merged over the winner's row.
+    const stored = await fetchRecord(record.id)
+    expect(stored.revision).toBe(record.revision + 1)
+    expect(stored.values[priority.id]).toBe(1)
+    expect(stored.values[title.id]).toBe("Unguarded race")
+    expect((await fetchRecord(record.id)).revision).toBe(record.revision + 1)
+  })
+
+  it("answers NOT_FOUND when the record was archived before the write", async () => {
+    const { table, fieldByName } = await seededWorkspace()
+    const title = fieldByName("Project Name")
+    const record = await createRecord(table.id, { [title.id]: "Archived target" })
+
+    const removed = await recordDELETE(
+      jsonRequest(`/api/records/${record.id}`, "DELETE"),
+      routeContext({ recordId: record.id }),
+    )
+    expect(removed.status).toBe(200)
+
+    const response = await recordPATCH(
+      jsonRequest(`/api/records/${record.id}`, "PATCH", {
+        values: { [title.id]: "Too late" },
+      }),
+      routeContext({ recordId: record.id }),
+    )
+    expect(response.status).toBe(404)
+    expect((await readJson<{ code: string }>(response)).code).toBe("NOT_FOUND")
   })
 
   it("reports only revisions the batch actually committed", async () => {
@@ -578,5 +648,105 @@ describe("rank ordering", () => {
     const ranks = records.map((record) => record.rank)
     expect([...ranks].sort()).toEqual(ranks)
     expect(records.slice(6).map((record) => record.values[title.id])).toEqual(appended)
+  })
+})
+
+/* -------------------------------------------------------------------------- */
+/* Migrations                                                                 */
+/* -------------------------------------------------------------------------- */
+
+const MIGRATION_TAGS = [
+  "0000_peaceful_jackpot",
+  "0001_open_microchip",
+  "0002_greedy_phantom_reporter",
+  "0003_forms_ai_integrity",
+] as const
+
+/** Applies migration files the way drizzle's migrator does: one statement at a time. */
+async function applyMigrations(
+  pglite: { exec: (sql: string) => Promise<unknown> },
+  tags: readonly string[],
+): Promise<void> {
+  const folder = path.resolve(process.cwd(), "drizzle")
+  for (const tag of tags) {
+    const sql = await readFile(path.join(folder, `${tag}.sql`), "utf8")
+    for (const statement of sql.split("--> statement-breakpoint")) {
+      const trimmed = statement.trim()
+      if (trimmed) await pglite.exec(trimmed)
+    }
+  }
+}
+
+describe("migration chain", () => {
+  it("creates the form identity indexes on a fresh database", async () => {
+    const pglite = new PGlite()
+    try {
+      await applyMigrations(pglite, MIGRATION_TAGS)
+      const { rows } = await pglite.query<{ indexname: string }>(
+        `select indexname from pg_indexes
+          where indexname in ('form_metric_buckets_identity_idx', 'form_versions_form_version_idx')
+          order by indexname`,
+      )
+      expect(rows.map((row) => row.indexname)).toEqual([
+        "form_metric_buckets_identity_idx",
+        "form_versions_form_version_idx",
+      ])
+    } finally {
+      await pglite.close()
+    }
+  })
+
+  it("dedupes rows an older database already holds instead of failing", async () => {
+    const pglite = new PGlite()
+    try {
+      await applyMigrations(pglite, MIGRATION_TAGS.slice(0, 2))
+      await pglite.exec(`
+        insert into "bases" (id, org_id, name, rank, created_by)
+          values ('base_1', 'org_demo', 'Demo', 'a0', 'user_test');
+        insert into "tables" (id, org_id, base_id, name, rank)
+          values ('tbl_1', 'org_demo', 'base_1', 'Grid', 'a0');
+        insert into "forms" (id, org_id, base_id, table_id, name, slug, created_by)
+          values ('form_1', 'org_demo', 'base_1', 'tbl_1', 'Signup', 'signup-1', 'user_test');
+        insert into "form_versions" (id, org_id, form_id, version_number, title, published_by)
+          values ('version_first', 'org_demo', 'form_1', 1, 'First', 'user_test'),
+                 ('version_second', 'org_demo', 'form_1', 1, 'Second', 'user_test');
+        insert into "form_metric_buckets"
+            (id, org_id, form_id, day, metric, breakdown_kind, breakdown_key, count)
+          values ('bucket_first', 'org_demo', 'form_1', '2026-01-01', 'view', 'total', 'all', 3),
+                 ('bucket_second', 'org_demo', 'form_1', '2026-01-01', 'view', 'total', 'all', 5),
+                 ('bucket_other', 'org_demo', 'form_1', '2026-01-02', 'view', 'total', 'all', 1);
+      `)
+
+      await applyMigrations(pglite, MIGRATION_TAGS.slice(2))
+
+      const versions = await pglite.query<{ id: string }>(
+        `select id from "form_versions" order by id`,
+      )
+      expect(versions.rows.map((row) => row.id)).toEqual(["version_first"])
+      const buckets = await pglite.query<{ id: string }>(
+        `select id from "form_metric_buckets" order by id`,
+      )
+      expect(buckets.rows.map((row) => row.id)).toEqual([
+        "bucket_first",
+        "bucket_other",
+      ])
+
+      // The surviving rows now back a real unique index.
+      await expect(
+        pglite.exec(`
+          insert into "form_versions" (id, org_id, form_id, version_number, title, published_by)
+            values ('version_dup', 'org_demo', 'form_1', 1, 'Third', 'user_test');
+        `),
+      ).rejects.toThrow()
+      await expect(
+        pglite.exec(`
+          insert into "form_metric_buckets"
+              (id, org_id, form_id, day, metric, breakdown_kind, breakdown_key, count)
+            values ('bucket_dup', 'org_demo', 'form_1', '2026-01-01', 'view', 'total', 'all', 9);
+        `),
+      ).rejects.toThrow()
+    } finally {
+      await pglite.close()
+    }
   })
 })

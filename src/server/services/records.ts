@@ -393,7 +393,9 @@ export async function updateRecord(
 
   // Single-statement compare-and-swap: the revision guard lives in the WHERE
   // clause, so a concurrent writer can never be silently overwritten between
-  // the read above and this write.
+  // the read above and this write. A caller that omits `expectedRevision` is
+  // still guarded, on the revision this request just read.
+  const guardRevision = input.expectedRevision ?? row.revision
   const [written] = await db
     .update(recordsTable)
     .set({
@@ -408,23 +410,27 @@ export async function updateRecord(
         eq(recordsTable.id, row.id),
         eq(recordsTable.orgId, orgId),
         eq(recordsTable.status, "active"),
-        input.expectedRevision !== undefined
-          ? eq(recordsTable.revision, input.expectedRevision)
-          : undefined,
+        eq(recordsTable.revision, guardRevision),
       ),
     )
     .returning({ revision: recordsTable.revision })
 
   if (!written) {
+    // A zero-row write means the row moved. Re-read without the active filter
+    // so that a record archived mid-flight answers NOT_FOUND, and only a
+    // revision that actually advanced answers REVISION_CONFLICT.
     const [current] = await db
-      .select({ revision: recordsTable.revision })
+      .select({ revision: recordsTable.revision, status: recordsTable.status })
       .from(recordsTable)
       .where(and(eq(recordsTable.id, row.id), eq(recordsTable.orgId, orgId)))
       .limit(1)
+    if (!current || current.status !== "active") {
+      throw new AppError("NOT_FOUND", "Record not found.")
+    }
     throw new AppError("REVISION_CONFLICT", "This record was updated by someone else.", {
       recordId: row.id,
-      expectedRevision: input.expectedRevision ?? row.revision,
-      actualRevision: current?.revision ?? row.revision,
+      expectedRevision: guardRevision,
+      actualRevision: current.revision,
     })
   }
 

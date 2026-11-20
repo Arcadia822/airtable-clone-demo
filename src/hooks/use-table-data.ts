@@ -538,9 +538,16 @@ export function useTableData(tableId: string) {
     [applyRevisions],
   )
 
-  /** Newest revision the server confirmed, so a queued write stops guessing. */
+  /**
+   * Revision to send with a write. Queued writes advance to the newest
+   * confirmed revision so consecutive edits to one record do not race each
+   * other. An `explicit` caller read the cell it is about to overwrite, so it
+   * must guard on exactly that revision: a concurrent edit then surfaces as a
+   * conflict instead of being silently overwritten.
+   */
   const effectiveRevision = useCallback(
-    (recordId: string, expectedRevision: number) => {
+    (recordId: string, expectedRevision: number, explicit = false) => {
+      if (explicit) return expectedRevision
       const known = latestRevisionsRef.current.get(recordId)
       return known === undefined
         ? expectedRevision
@@ -703,6 +710,8 @@ export function useTableData(tableId: string) {
       fieldId: string
       value: CellValue
       expectedRevision: number
+      /** Guard on exactly `expectedRevision` instead of the newest confirmed one. */
+      exactRevision?: boolean
     }>) => {
       const snapshots = captureCellSnapshots(updates)
       applyCellValues(updates)
@@ -717,10 +726,13 @@ export function useTableData(tableId: string) {
                 method: "PATCH",
                 body: JSON.stringify({
                   updates: updates.map((update) => ({
-                    ...update,
+                    recordId: update.recordId,
+                    fieldId: update.fieldId,
+                    value: update.value,
                     expectedRevision: effectiveRevision(
                       update.recordId,
                       update.expectedRevision,
+                      update.exactRevision === true,
                     ),
                   })),
                 }),
@@ -1081,6 +1093,10 @@ export function useTableData(tableId: string) {
           const latest = await requestJson<{ record: GridRecord }>(
             `/api/records/${encodeURIComponent(target.recordId)}`,
           )
+          // The cell below is merged from this response, so the write must
+          // guard on exactly this revision. Using the newest confirmed revision
+          // instead would let a concurrent edit that landed after the read be
+          // overwritten instead of reported as a conflict.
           const known = latestRevisionsRef.current.get(target.recordId) ?? 0
           latestRevisionsRef.current.set(
             target.recordId,
@@ -1094,6 +1110,7 @@ export function useTableData(tableId: string) {
               fieldId: target.fieldId,
               value: [...current, ...uploaded] as CellValue,
               expectedRevision: latest.record.revision,
+              exactRevision: true,
             },
           ])
           if ("saved" in outcome && outcome.saved === false) {
