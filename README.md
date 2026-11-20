@@ -41,9 +41,9 @@ write before it touches your data.
 | --- | --- |
 | Framework | Next.js 16.4.1 (App Router, Turbopack, React Compiler) |
 | UI | React 19, Tailwind CSS v4, Base UI, TanStack Table + Virtual, Recharts |
-| Data | Drizzle ORM over PGlite (local), Postgres, or Neon HTTP |
-| Auth | Factory visitor session (`FACTORY_VISITOR_AUTH_URL/TOKEN`) or local single-tenant mode |
-| Tests | Vitest (299 unit/integration), Playwright (8 end-to-end) |
+| Data | Drizzle ORM over PGlite (local), Postgres, or Neon serverless (WebSocket) |
+| Auth | Factory visitor session (`FACTORY_VISITOR_AUTH_URL/TOKEN`), or an explicitly opted-in local single-tenant mode |
+| Tests | Vitest (416 unit/integration), Playwright (8 end-to-end) |
 
 ## Quick start
 
@@ -82,11 +82,35 @@ Everything is optional in local development; production needs a database.
 | `LLM_GATEWAY_MODEL` | Model id for that fallback gateway. |
 | `UPLOAD_DIR` | Directory for the filesystem attachment adapter (default `.data/uploads`, `ATTACHMENT_STORAGE=fs` only). |
 | `ATTACHMENT_STORAGE` | `postgres` (default, durable) or `fs` (local debugging only). |
+| `ALLOW_LOCAL_WORKSPACE` | `1` keeps the local single-tenant workspace on a deployed instance. Without it a production or Vercel deployment with no Factory credentials answers `503 AUTH_NOT_CONFIGURED` instead of signing everyone in locally. Local development never needs it. |
+| `TURNSTILE_SECRET_KEY` | Optional Cloudflare Turnstile secret. When set, public submit, metric, and upload requests must carry a verified widget token. |
+| `NEXT_PUBLIC_TURNSTILE_SITE_KEY` | Public half of the same Turnstile widget; set it together with the secret. |
 | `NEXT_PUBLIC_APP_URL` | Absolute origin used in metadata and auth callbacks (default `http://localhost:3000`). |
 | `FACTORY_PREVIEW_HOST` | Preferred origin sent to visitor auth on preview deployments. |
 
 Attachment limits: 25 MB per file, 10 files per cell, one image per image cell,
-stored as 1 MiB chunks in `attachment_chunks`/`attachment_blobs`.
+stored as 1 MiB chunks in `attachment_chunks`/`attachment_blobs`. The stored type
+is sniffed from the file's leading bytes; SVG, HTML, and XML are rejected, and
+anything unrecognized is served as an `application/octet-stream` download.
+
+## Security model
+
+- **Auth fails closed.** A deployed instance (`NODE_ENV=production` or any
+  `VERCEL_ENV`) with no Factory visitor credentials and no
+  `ALLOW_LOCAL_WORKSPACE=1` refuses every authenticated request with
+  `503 AUTH_NOT_CONFIGURED`. Local development is unchanged.
+- **Cookie-authenticated writes check origin.** Every mutating route and the
+  JSON record query assert same origin before touching data, so a cross-site
+  form post cannot ride a session cookie.
+- **Public surfaces are rate limited.** Submit, metric, and upload endpoints
+  use a per-IP, per-form fixed window (10/min, 60/min, 20/min), and verify a
+  Cloudflare Turnstile token when `TURNSTILE_SECRET_KEY` is set.
+- **AI writes need a server-issued ticket.** The chat route mints an opaque
+  proposal token bound to the session, operation, and input hash; the write
+  route consumes it exactly once inside a 15-minute TTL and executes the input
+  the server stored, never the client's copy.
+- **Deletes are archives.** Forms, fields, and records are marked archived, so
+  nothing a member can still be shown loses its data.
 
 ## Scripts
 
@@ -108,11 +132,15 @@ worker because the tests share the seeded workspace.
 
 | Check | Result |
 | --- | --- |
-| `pnpm build` (Next 16.4.1, Turbopack) | exit 0, 14 s cold (compile 5.5 s, TS 5.3 s) |
-| `npx vitest run` | 54 files, 299 tests passed, 12.6 s |
-| `npx playwright test tests/e2e/workspace.spec.ts` | 8 tests passed, 11.4 s |
-| `next start` cold boot | ready in ~1.0 s (Next reports 125 ms), first seeded page 1.0 s |
-| `next-server` RSS | ~287 MB idle at boot, ~546 MB after migrations + seed (PGlite shares the Node heap) |
+| `npx tsc --noEmit` | clean |
+| `pnpm build` (Next 16.4.1, Turbopack) | exit 0, 5.7 s with a warm `.next` cache (a cold compile pass takes ~12.5 s) |
+| `npx vitest run` | 60 files, 416 tests passed, 19.8 s |
+| `npx playwright test tests/e2e/workspace.spec.ts` | 8 tests passed, 9.0 s |
+| `next-server` RSS | 586 000 KB (~572 MiB) after migrations, seed, and the first table render (PGlite shares the Node heap) |
+
+The Playwright suite runs `next start`, which is a production build, so its
+`webServer` env sets `ALLOW_LOCAL_WORKSPACE=1`; without it the fail-closed auth
+gate would answer `503` to every request.
 
 ## Known limitations
 
@@ -133,6 +161,21 @@ worker because the tests share the seeded workspace.
   do not point several instances at one embedded database directory.
 - **Migration baseline is committed.** `drizzle/` is authoritative; a host that
   rejects a non-empty baseline needs an explicit baseline step.
+- **Rate limits are per instance.** The fixed-window limiter lives in process
+  memory, so N replicas allow roughly N times the stated budget. The platform
+  proxy is the outer bound; Turnstile is the per-visitor control.
+- **Respondent dedupe is heuristic.** A form set to one response per person
+  keys on address plus user agent, which two people behind one NAT and one
+  browser will share. Forms that need stronger identity must add a question.
+- **Cookie-authenticated writes are origin-checked, not CSRF-token-checked.**
+  The guard accepts a request whose `Origin` is the deployment origin (or the
+  concrete request host), and rejects `Sec-Fetch-Site: same-site`, because a
+  sibling subdomain is not ours to trust. A request that sends neither header
+  is treated as a non-browser client, which cannot be tricked into replaying a
+  victim's cookie.
+- **Proposal pruning is opportunistic.** Expired AI approval rows are dropped
+  in batches of 50 whenever a new proposal is issued, so a deployment that
+  stops using the assistant keeps its last expired rows until it does again.
 
 ## Repository map
 
