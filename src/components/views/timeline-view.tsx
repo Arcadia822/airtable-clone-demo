@@ -10,6 +10,7 @@ import {
 
 import { RecordDrawer } from "@/components/views/record-drawer"
 import { Button } from "@/components/ui/button"
+import { useCompactViewport } from "@/hooks/use-mobile"
 import type {
   CellValue,
   FieldDefinition,
@@ -231,6 +232,7 @@ export function TimelineView({
   const [unscheduledOpen, setUnscheduledOpen] = useState(true)
   const scrollRef = useRef<HTMLDivElement>(null)
   const activeScale = scale ?? internalScale
+  const compact = useCompactViewport()
   const today = useMemo(() => startOfDay(new Date()), [])
 
   const dateFields = useMemo(
@@ -374,13 +376,35 @@ export function TimelineView({
     )
   }
 
+  function renderCompactRow(bar: TimelineBar) {
+    const record = bar.record
+    const title = recordLabel(
+      primary ? record.values[primary.id] : undefined,
+    )
+    return (
+      <li className="border-b last:border-b-0" key={record.id}>
+        <button
+          aria-label={`Open ${title}`}
+          className="flex w-full min-w-0 flex-col gap-0.5 px-2 py-2 text-left hover:bg-muted/30"
+          onClick={() => setOpenRecordId(record.id)}
+          type="button"
+        >
+          <span className="truncate text-xs font-medium">{title}</span>
+          <span className="text-[11px] tabular-nums text-muted-foreground">
+            {barDateRangeLabel(bar)}
+          </span>
+        </button>
+      </li>
+    )
+  }
+
   const scheduledCount = bars.length
 
   return (
     <>
       <section
         aria-label={`Timeline using ${startField.name}`}
-        className="flex min-h-0 flex-1 flex-col bg-muted/15"
+        className="flex min-h-0 w-full min-w-0 max-w-full flex-1 flex-col overflow-hidden bg-muted/15"
       >
         <header className="flex flex-wrap items-center gap-1.5 border-b bg-background px-2 py-1.5 sm:px-3">
           <div
@@ -490,8 +514,60 @@ export function TimelineView({
           ) : null}
         </header>
 
-        <div className="min-h-0 flex-1 overflow-auto" ref={scrollRef}>
-          <div className="min-w-[620px]">
+        {compact ? (
+          <div className="min-h-0 min-w-0 max-w-full flex-1 overflow-y-auto bg-background">
+            {lanes ? (
+              lanes.map((lane) => {
+                const laneBars = lane.records
+                  .map((record) => barsByRecordId.get(record.id))
+                  .filter((bar): bar is TimelineBar => Boolean(bar))
+                return (
+                  <section
+                    aria-label={`${lane.label} group`}
+                    className="border-b last:border-b-0"
+                    key={lane.id ?? "unassigned"}
+                  >
+                    <div className="flex items-center gap-1.5 bg-muted/40 px-2 py-1.5">
+                      <span
+                        aria-hidden
+                        className="size-2 shrink-0 rounded-full"
+                        style={{ backgroundColor: lane.color ?? "#94A3B8" }}
+                      />
+                      <h3 className="min-w-0 flex-1 truncate text-[11px] font-semibold">
+                        {lane.label}
+                      </h3>
+                      <span className="text-[10px] text-muted-foreground">
+                        {lane.records.length}
+                      </span>
+                    </div>
+                    <ul>{laneBars.map((bar) => renderCompactRow(bar))}</ul>
+                    {laneBars.length === 0 ? (
+                      <p className="px-3 py-2 text-xs text-muted-foreground">
+                        No scheduled records in this group yet.
+                      </p>
+                    ) : null}
+                  </section>
+                )
+              })
+            ) : (
+              <ul>{bars.map((bar) => renderCompactRow(bar))}</ul>
+            )}
+            {bars.length === 0 ? (
+              <div className="flex flex-col items-center justify-center gap-2 px-6 py-12 text-center">
+                <p className="text-sm font-medium">Nothing scheduled yet</p>
+                <p className="max-w-xs text-xs text-muted-foreground">
+                  Add a date to “{startField.name}” and the record will appear on
+                  this timeline.
+                </p>
+              </div>
+            ) : null}
+          </div>
+        ) : (
+          <div
+            className="min-h-0 min-w-0 max-w-full flex-1 overflow-auto"
+            ref={scrollRef}
+          >
+            <div className="min-w-[620px]">
             <div className="sticky top-0 z-20 flex border-b bg-background/95 backdrop-blur">
               <div className="sticky left-0 z-30 w-36 shrink-0 border-r bg-background px-2 py-2 text-[10px] font-semibold uppercase tracking-[0.12em] text-muted-foreground sm:w-52 sm:px-3">
                 Records
@@ -563,8 +639,9 @@ export function TimelineView({
                 </p>
               </div>
             ) : null}
+            </div>
           </div>
-        </div>
+        )}
 
         <footer className="shrink-0 border-t bg-background">
           <button

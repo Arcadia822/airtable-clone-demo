@@ -7,6 +7,7 @@ import {
 } from "@testing-library/react"
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest"
 
+import { CalendarView } from "@/components/views/calendar-view"
 import { DashboardView } from "@/components/views/dashboard-view"
 import { MobileRecordList } from "@/components/views/mobile-record-list"
 import { TimelineView } from "@/components/views/timeline-view"
@@ -325,6 +326,85 @@ describe("TimelineView", () => {
     expect(
       screen.getByRole("dialog", { name: "Atlas launch" }),
     ).toBeInTheDocument()
+  })
+})
+
+function setViewportWidth(width: number) {
+  const previous = window.innerWidth
+  window.innerWidth = width
+  return () => {
+    window.innerWidth = previous
+  }
+}
+
+describe("compact viewport", () => {
+  it("stacks the timeline into a list instead of a fixed-width track at 375px", () => {
+    const restore = setViewportWidth(375)
+    try {
+      render(
+        <TimelineView
+          endField={endField}
+          fields={fields}
+          groupField={statusField}
+          onUpdateCell={vi.fn()}
+          records={records}
+          startField={startField}
+        />,
+      )
+
+      const region = screen.getByRole("region", {
+        name: "Timeline using Kickoff",
+      })
+      expect(region).toHaveClass("min-w-0", "max-w-full", "overflow-hidden")
+      expect(document.querySelector(".min-w-\\[620px\\]")).toBeNull()
+      expect(
+        screen.getByRole("heading", { name: "Planned" }),
+      ).toBeInTheDocument()
+      expect(
+        screen.getByText("Mar 2, 2026 → Mar 6, 2026"),
+      ).toBeInTheDocument()
+      expect(
+        screen.getByRole("button", { name: "Open Atlas launch" }),
+      ).toBeInTheDocument()
+      expect(screen.getByText("Unscheduled (1)")).toBeInTheDocument()
+    } finally {
+      restore()
+    }
+  })
+
+  it("switches the calendar to its agenda list at 375px", () => {
+    const restore = setViewportWidth(375)
+    const onUpdateCell = vi.fn()
+    try {
+      render(
+        <CalendarView
+          dateField={startField}
+          fields={fields}
+          onUpdateCell={onUpdateCell}
+          records={records}
+        />,
+      )
+
+      const agenda = screen.getByLabelText("Agenda using Kickoff")
+      expect(agenda).toHaveClass("min-w-0", "max-w-full")
+      expect(screen.queryByLabelText("Calendar using Kickoff")).toBeNull()
+      expect(
+        screen.queryByRole("group", { name: "Calendar display" }),
+      ).toBeNull()
+      expect(screen.getByText("Nothing scheduled this month")).toBeInTheDocument()
+
+      fireEvent.change(screen.getByLabelText("Move Cobalt audit to date"), {
+        target: { value: "2026-11-24" },
+      })
+      expect(onUpdateCell).toHaveBeenCalledWith(
+        cobalt.id,
+        startField.id,
+        expect.any(String),
+        cobalt.revision,
+      )
+    } finally {
+      restore()
+    }
   })
 })
 

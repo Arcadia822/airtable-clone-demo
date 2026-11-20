@@ -6,6 +6,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import type { ViewControlsValue } from "@/components/workspace/view-controls"
 
 import type {
+  AttachmentValue,
   CellValue,
   DashboardWidgetConfig,
   FieldConfig,
@@ -144,6 +145,14 @@ export type AttachmentUploadTarget = {
   fieldId: string
 }
 
+type CellWriteTarget = { recordId: string; fieldId: string }
+
+type CellSnapshot = CellWriteTarget & {
+  hadValue: boolean
+  value: CellValue | undefined
+  token: number
+}
+
 /**
  * Owns every read and write for one table workspace. The server is the source
  * of truth for view configuration; cell writes are the only optimistic path
@@ -169,6 +178,33 @@ export function useTableData(tableId: string) {
 
   const queryKeyRef = useRef(0)
 
+  // Mirrors the committed rows so a failed write can put the old cell back.
+  const recordsRef = useRef<GridRecord[]>(records)
+  // Highest revision the server has confirmed for each record.
+  const latestRevisionsRef = useRef(new Map<string, number>())
+  // Writes queued per record so consecutive edits reuse the newest revision.
+  const recordWritesRef = useRef(new Map<string, Promise<unknown>>())
+  // Uploads queued per cell so two batches never merge the same array twice.
+  const uploadChainsRef = useRef(new Map<string, Promise<unknown>>())
+  // Sequence tokens let a stale rollback skip cells a newer write owns.
+  const cellWriteSeqRef = useRef(0)
+  const cellWriteTokensRef = useRef(new Map<string, number>())
+  const pendingWritesRef = useRef(0)
+
+  const beginWrite = useCallback(() => {
+    pendingWritesRef.current += 1
+    setSyncing(true)
+  }, [])
+
+  const endWrite = useCallback(() => {
+    pendingWritesRef.current = Math.max(0, pendingWritesRef.current - 1)
+    setSyncing(pendingWritesRef.current > 0)
+  }, [])
+
+  useEffect(() => {
+    recordsRef.current = records
+  }, [records])
+
   const runQuery = useCallback(
     async (
       view: WorkspaceViewDto | undefined,
@@ -191,6 +227,12 @@ export function useTableData(tableId: string) {
       setTotalRecordCount(result.totalCount)
       setGroupLabels(result.groupLabelsByRecordId ?? {})
       setGroupCounts(flattenGroupCounts(result.groups ?? []))
+      for (const record of result.records) {
+        const known = latestRevisionsRef.current.get(record.id) ?? 0
+        if (record.revision > known) {
+          latestRevisionsRef.current.set(record.id, record.revision)
+        }
+      }
     },
     [tableId],
   )
@@ -276,7 +318,7 @@ export function useTableData(tableId: string) {
       const view = bundle?.views.find((candidate) => candidate.id === viewId)
       if (!view) return
       setActiveViewId(viewId)
-      setSyncing(true)
+      beginWrite()
       try {
         await runQuery(view, search)
       } catch (queryError) {
@@ -284,7 +326,7 @@ export function useTableData(tableId: string) {
           queryError instanceof Error ? queryError.message : "Could not load this view.",
         )
       } finally {
-        setSyncing(false)
+        endWrite()
       }
     },
     [bundle?.views, runQuery, search],
@@ -293,7 +335,7 @@ export function useTableData(tableId: string) {
   const applySearch = useCallback(
     async (value: string) => {
       setSearch(value)
-      setSyncing(true)
+      beginWrite()
       try {
         await runQuery(activeView, value)
       } catch (queryError) {
@@ -301,7 +343,7 @@ export function useTableData(tableId: string) {
           queryError instanceof Error ? queryError.message : "Search failed.",
         )
       } finally {
-        setSyncing(false)
+        endWrite()
       }
     },
     [activeView, runQuery],
@@ -335,7 +377,7 @@ export function useTableData(tableId: string) {
   const updateControls = useCallback(
     async (next: ViewControlsValue) => {
       if (!activeView) return false
-      setSyncing(true)
+      beginWrite()
       try {
         const view = await persistView(activeView.id, {
           filterConjunction: next.filterConjunction,
@@ -353,7 +395,7 @@ export function useTableData(tableId: string) {
         )
         return false
       } finally {
-        setSyncing(false)
+        endWrite()
       }
     },
     [activeView, persistView, runQuery, search],
@@ -362,11 +404,11 @@ export function useTableData(tableId: string) {
   const applyView = useCallback(
     async (view: WorkspaceViewDto) => {
       setActiveViewId(view.id)
-      setSyncing(true)
+      beginWrite()
       try {
         await runQuery(view, search)
       } finally {
-        setSyncing(false)
+        endWrite()
       }
     },
     [runQuery, search],
@@ -417,7 +459,7 @@ export function useTableData(tableId: string) {
   const updateViewConfiguration = useCallback(
     async (patch: Record<string, unknown>) => {
       if (!activeView) return
-      setSyncing(true)
+      beginWrite()
       try {
         const view = await persistView(activeView.id, {
           configuration: { ...activeView.configuration, ...patch },
@@ -435,7 +477,7 @@ export function useTableData(tableId: string) {
             : current,
         )
       } finally {
-        setSyncing(false)
+        endWrite()
       }
     },
     [activeView, persistView],
@@ -485,47 +527,174 @@ export function useTableData(tableId: string) {
     [],
   )
 
-  const updateCell = useCallback(
-    (recordId: string, fieldId: string, value: CellValue, expectedRevision: number) => {
-      setRecords((current) =>
-        current.map((record) =>
-          record.id === recordId
-            ? { ...record, values: { ...record.values, [fieldId]: value } }
-            : record,
-        ),
-      )
-      setSyncing(true)
-      void (async () => {
-        try {
-          const result = await requestJson<{
-            revisions: Record<string, number>
-          }>(`/api/tables/${encodeURIComponent(tableId)}/records/batch`, {
-            method: "PATCH",
-            body: JSON.stringify({
-              updates: [{ recordId, fieldId, value, expectedRevision }],
-            }),
-          })
-          applyRevisions(
-            Object.entries(result.revisions ?? {}).map(([id, revision]) => ({
-              recordId: id,
-              revision,
-            })),
-          )
-        } catch (writeError) {
-          if (writeError instanceof ApiError && writeError.isRevisionConflict) {
-            setError("Someone else changed this record. Reloading the latest values.")
-          } else {
-            setError(
-              writeError instanceof Error ? writeError.message : "Could not save this cell.",
-            )
-          }
-          await refreshRecords().catch(() => undefined)
-        } finally {
-          setSyncing(false)
-        }
-      })()
+  const rememberRevisions = useCallback(
+    (revisions: Array<{ recordId: string; revision: number }>) => {
+      if (!revisions.length) return
+      for (const revision of revisions) {
+        latestRevisionsRef.current.set(revision.recordId, revision.revision)
+      }
+      applyRevisions(revisions)
     },
-    [applyRevisions, refreshRecords, tableId],
+    [applyRevisions],
+  )
+
+  /** Newest revision the server confirmed, so a queued write stops guessing. */
+  const effectiveRevision = useCallback(
+    (recordId: string, expectedRevision: number) => {
+      const known = latestRevisionsRef.current.get(recordId)
+      return known === undefined
+        ? expectedRevision
+        : Math.max(known, expectedRevision)
+    },
+    [],
+  )
+
+  const captureCellSnapshots = useCallback(
+    (cells: readonly CellWriteTarget[]): CellSnapshot[] => {
+      const byId = new Map(recordsRef.current.map((record) => [record.id, record]))
+      return cells.map((cell) => {
+        const record = byId.get(cell.recordId)
+        const token = ++cellWriteSeqRef.current
+        cellWriteTokensRef.current.set(`${cell.recordId}:${cell.fieldId}`, token)
+        return {
+          ...cell,
+          hadValue: record
+            ? Object.prototype.hasOwnProperty.call(record.values, cell.fieldId)
+            : false,
+          value: record?.values[cell.fieldId],
+          token,
+        }
+      })
+    },
+    [],
+  )
+
+  const restoreCellSnapshots = useCallback(
+    (snapshots: readonly CellSnapshot[]) => {
+      const byRecordId = new Map<string, Map<string, CellSnapshot>>()
+      for (const snapshot of snapshots) {
+        const key = `${snapshot.recordId}:${snapshot.fieldId}`
+        // A newer write owns this cell now; keep its optimistic value.
+        if (cellWriteTokensRef.current.get(key) !== snapshot.token) continue
+        cellWriteTokensRef.current.delete(key)
+        const fields =
+          byRecordId.get(snapshot.recordId) ?? new Map<string, CellSnapshot>()
+        fields.set(snapshot.fieldId, snapshot)
+        byRecordId.set(snapshot.recordId, fields)
+      }
+      if (!byRecordId.size) return
+      setRecords((current) =>
+        current.map((record) => {
+          const fields = byRecordId.get(record.id)
+          if (!fields) return record
+          const values = { ...record.values }
+          for (const [fieldId, snapshot] of fields) {
+            if (snapshot.hadValue) values[fieldId] = snapshot.value as CellValue
+            else delete values[fieldId]
+          }
+          return { ...record, values }
+        }),
+      )
+    },
+    [],
+  )
+
+  const enqueueRecordWrites = useCallback(
+    <T,>(recordIds: readonly string[], task: () => Promise<T>): Promise<T> => {
+      const ids = [...new Set(recordIds)]
+      const pending = ids.map(
+        (recordId) => recordWritesRef.current.get(recordId) ?? Promise.resolve(),
+      )
+      const next = Promise.all(
+        pending.map((write) => write.catch(() => undefined)),
+      ).then(task)
+      const tracked = next.catch(() => undefined)
+      for (const recordId of ids) {
+        recordWritesRef.current.set(recordId, tracked)
+        void tracked.finally(() => {
+          if (recordWritesRef.current.get(recordId) === tracked) {
+            recordWritesRef.current.delete(recordId)
+          }
+        })
+      }
+      return next
+    },
+    [],
+  )
+
+  /**
+   * Optimistically paints the cell, then writes it. Any rejection restores the
+   * pre-write value, and the returned promise carries the server revision so
+   * consecutive writes to one record queue instead of racing on a stale one.
+   */
+  const updateCell = useCallback(
+    (
+      recordId: string,
+      fieldId: string,
+      value: CellValue,
+      expectedRevision: number,
+    ): Promise<number | null> => {
+      const snapshots = captureCellSnapshots([{ recordId, fieldId }])
+      applyCellValues([{ recordId, fieldId, value }])
+      beginWrite()
+      return enqueueRecordWrites([recordId], async () => {
+        try {
+          const result = await requestJson<{ revisions: Record<string, number> }>(
+            `/api/tables/${encodeURIComponent(tableId)}/records/batch`,
+            {
+              method: "PATCH",
+              body: JSON.stringify({
+                updates: [
+                  {
+                    recordId,
+                    fieldId,
+                    value,
+                    expectedRevision: effectiveRevision(
+                      recordId,
+                      expectedRevision,
+                    ),
+                  },
+                ],
+              }),
+            },
+          )
+          const revisions = Object.entries(result.revisions ?? {}).map(
+            ([id, revision]) => ({ recordId: id, revision }),
+          )
+          rememberRevisions(revisions)
+          return result.revisions?.[recordId] ?? null
+        } catch (writeError) {
+          restoreCellSnapshots(snapshots)
+          const conflict =
+            writeError instanceof ApiError && writeError.isRevisionConflict
+          setError(
+            conflict
+              ? "Someone else changed this record. Showing the latest saved values."
+              : writeError instanceof Error
+                ? writeError.message
+                : "Could not save this cell.",
+          )
+          if (conflict) {
+            await refreshRecords().catch(() => undefined)
+          }
+          return null
+        } finally {
+          endWrite()
+        }
+      })
+    },
+    [
+      applyCellValues,
+      beginWrite,
+      captureCellSnapshots,
+      effectiveRevision,
+      endWrite,
+      enqueueRecordWrites,
+      refreshRecords,
+      rememberRevisions,
+      restoreCellSnapshots,
+      tableId,
+    ],
   )
 
   const batchUpdateCells = useCallback(
@@ -535,35 +704,65 @@ export function useTableData(tableId: string) {
       value: CellValue
       expectedRevision: number
     }>) => {
+      const snapshots = captureCellSnapshots(updates)
       applyCellValues(updates)
-      setSyncing(true)
+      beginWrite()
       try {
-        const result = await requestJson<{ revisions: Record<string, number> }>(
-          `/api/tables/${encodeURIComponent(tableId)}/records/batch`,
-          { method: "PATCH", body: JSON.stringify({ updates }) },
+        const result = await enqueueRecordWrites(
+          updates.map((update) => update.recordId),
+          () =>
+            requestJson<{ revisions: Record<string, number> }>(
+              `/api/tables/${encodeURIComponent(tableId)}/records/batch`,
+              {
+                method: "PATCH",
+                body: JSON.stringify({
+                  updates: updates.map((update) => ({
+                    ...update,
+                    expectedRevision: effectiveRevision(
+                      update.recordId,
+                      update.expectedRevision,
+                    ),
+                  })),
+                }),
+              },
+            ),
         )
         const revisions = Object.entries(result.revisions ?? {}).map(
           ([recordId, revision]) => ({ recordId, revision }),
         )
-        applyRevisions(revisions)
+        rememberRevisions(revisions)
         return { revisions }
       } catch (writeError) {
+        restoreCellSnapshots(snapshots)
+        const conflict =
+          writeError instanceof ApiError && writeError.isRevisionConflict
         const message =
           writeError instanceof Error ? writeError.message : "Could not save changes."
-        if (writeError instanceof ApiError && writeError.isRevisionConflict) {
+        if (conflict) {
           await refreshRecords().catch(() => undefined)
         }
         return { saved: false as const, message }
       } finally {
-        setSyncing(false)
+        endWrite()
       }
     },
-    [applyCellValues, applyRevisions, refreshRecords, tableId],
+    [
+      applyCellValues,
+      beginWrite,
+      captureCellSnapshots,
+      effectiveRevision,
+      endWrite,
+      enqueueRecordWrites,
+      refreshRecords,
+      rememberRevisions,
+      restoreCellSnapshots,
+      tableId,
+    ],
   )
 
   const addRecord = useCallback(
     async (initialValues: Record<string, CellValue> = {}) => {
-      setSyncing(true)
+      beginWrite()
       try {
         await requestJson(`/api/tables/${encodeURIComponent(tableId)}/records`, {
           method: "POST",
@@ -577,16 +776,16 @@ export function useTableData(tableId: string) {
         )
         return false
       } finally {
-        setSyncing(false)
+        endWrite()
       }
     },
-    [refreshRecords, tableId],
+    [beginWrite, endWrite, refreshRecords, tableId],
   )
 
   const deleteRecords = useCallback(
     async (recordsToDelete: readonly GridRecord[]) => {
       if (!recordsToDelete.length) return false
-      setSyncing(true)
+      beginWrite()
       try {
         await requestJson(`/api/tables/${encodeURIComponent(tableId)}/records`, {
           method: "DELETE",
@@ -602,10 +801,10 @@ export function useTableData(tableId: string) {
         )
         return false
       } finally {
-        setSyncing(false)
+        endWrite()
       }
     },
-    [refreshRecords, tableId],
+    [beginWrite, endWrite, refreshRecords, tableId],
   )
 
   const duplicateRecords = useCallback(
@@ -621,7 +820,8 @@ export function useTableData(tableId: string) {
           )
           .map((field) => field.id),
       )
-      setSyncing(true)
+      const created: string[] = []
+      beginWrite()
       try {
         for (const record of recordsToDuplicate) {
           const values = Object.fromEntries(
@@ -633,21 +833,30 @@ export function useTableData(tableId: string) {
             method: "POST",
             body: JSON.stringify({ values }),
           })
+          created.push(record.id)
         }
         await refreshRecords()
         return true
       } catch (duplicateError) {
-        setError(
+        const reason =
           duplicateError instanceof Error
             ? duplicateError.message
-            : "Could not duplicate records.",
+            : "Could not duplicate records."
+        setError(
+          created.length
+            ? `Duplicated ${created.length} of ${recordsToDuplicate.length} records before the request failed. ${reason}`
+            : reason,
         )
+        // Surface the copies that did land instead of leaving them invisible.
+        if (created.length) {
+          await refreshRecords().catch(() => undefined)
+        }
         return false
       } finally {
-        setSyncing(false)
+        endWrite()
       }
     },
-    [bundle?.fields, refreshRecords, tableId],
+    [beginWrite, bundle?.fields, endWrite, refreshRecords, tableId],
   )
 
   /* ---------------------------------------------------------------------- */
@@ -656,7 +865,7 @@ export function useTableData(tableId: string) {
 
   const addField = useCallback(
     async (field: { name: string; type: FieldType; config?: FieldConfig }) => {
-      setSyncing(true)
+      beginWrite()
       try {
         await requestJson(`/api/tables/${encodeURIComponent(tableId)}/fields`, {
           method: "POST",
@@ -666,7 +875,7 @@ export function useTableData(tableId: string) {
             config: field.config ?? {},
           }),
         })
-        await refresh()
+        await refresh(activeViewId)
         return true
       } catch (fieldError) {
         setError(
@@ -674,15 +883,15 @@ export function useTableData(tableId: string) {
         )
         return false
       } finally {
-        setSyncing(false)
+        endWrite()
       }
     },
-    [refresh, tableId],
+    [activeViewId, beginWrite, endWrite, refresh, tableId],
   )
 
   const patchField = useCallback(
     async (fieldId: string, patch: Record<string, unknown>) => {
-      await requestJson<{ field: FieldDefinition }>(
+      const { field } = await requestJson<{ field: FieldDefinition }>(
         `/api/fields/${encodeURIComponent(fieldId)}`,
         { method: "PATCH", body: JSON.stringify(patch) },
       )
@@ -691,13 +900,12 @@ export function useTableData(tableId: string) {
           ? {
               ...current,
               fields: current.fields
-                .map((field) =>
-                  field.id === fieldId ? { ...field, ...patch } as FieldDefinition : field,
-                )
+                .map((candidate) => (candidate.id === field.id ? field : candidate))
                 .sort((left, right) => (left.rank < right.rank ? -1 : 1)),
             }
           : current,
       )
+      return field
     },
     [],
   )
@@ -769,21 +977,21 @@ export function useTableData(tableId: string) {
         setError(
           fieldError instanceof Error ? fieldError.message : "Could not reorder columns.",
         )
-        await refresh()
+        await refresh(activeViewId)
         return false
       }
     },
-    [bundle?.fields, refresh],
+    [activeViewId, bundle?.fields, refresh],
   )
 
   const deleteField = useCallback(
     async (fieldId: string) => {
-      setSyncing(true)
+      beginWrite()
       try {
         await requestJson(`/api/fields/${encodeURIComponent(fieldId)}`, {
           method: "DELETE",
         })
-        await refresh()
+        await refresh(activeViewId)
         return true
       } catch (fieldError) {
         setError(
@@ -791,10 +999,10 @@ export function useTableData(tableId: string) {
         )
         return false
       } finally {
-        setSyncing(false)
+        endWrite()
       }
     },
-    [refresh],
+    [activeViewId, beginWrite, endWrite, refresh],
   )
 
   const duplicateField = useCallback(
@@ -819,74 +1027,97 @@ export function useTableData(tableId: string) {
 
   /**
    * Three-step attachment upload: open a session, PUT the bytes, finalize, then
-   * append the new attachment to the record cell.
+   * append the new attachments to the record cell. Uploads for one cell run in
+   * sequence, and the final write re-reads the record so it merges against the
+   * server's current cell and revision instead of a pre-upload snapshot.
    */
   const uploadAttachments = useCallback(
-    async (target: AttachmentUploadTarget, files: File[]) => {
-      const record = records.find((candidate) => candidate.id === target.recordId)
-      if (!record || !files.length) return
-      setSyncing(true)
-      try {
-        const existing = Array.isArray(record.values[target.fieldId])
-          ? (record.values[target.fieldId] as unknown[])
-          : []
-        const appended: unknown[] = [...existing]
-        for (const file of files) {
-          const session = await requestJson<{
-            uploadSessionId: string
-            uploadUrl: string
-          }>("/api/attachments/session", {
-            method: "POST",
-            body: JSON.stringify({
-              tableId,
-              fieldId: target.fieldId,
+    (target: AttachmentUploadTarget, files: File[]): Promise<void> => {
+      if (!files.length) return Promise.resolve()
+      const cellKey = `${target.recordId}:${target.fieldId}`
+      const previous = uploadChainsRef.current.get(cellKey) ?? Promise.resolve()
+      const next = previous.catch(() => undefined).then(async () => {
+        beginWrite()
+        try {
+          const uploaded: unknown[] = []
+          for (const file of files) {
+            const session = await requestJson<{
+              uploadSessionId: string
+              uploadUrl: string
+            }>("/api/attachments/session", {
+              method: "POST",
+              body: JSON.stringify({
+                tableId,
+                fieldId: target.fieldId,
+                recordId: target.recordId,
+              }),
+            })
+            const stored = await requestJson<{
+              storageId: string
+              name: string
+              mimeType: string
+            }>(session.uploadUrl, {
+              method: "PUT",
+              body: file,
+              headers: {
+                "content-type": file.type || "application/octet-stream",
+                "x-file-name": file.name,
+              },
+            })
+            const finalized = await requestJson<{
+              attachment: AttachmentValue
+            }>("/api/attachments/finalize", {
+              method: "POST",
+              body: JSON.stringify({
+                uploadSessionId: session.uploadSessionId,
+                storageId: stored.storageId,
+                name: stored.name,
+                mimeType: stored.mimeType,
+              }),
+            })
+            uploaded.push(finalized.attachment)
+          }
+
+          const latest = await requestJson<{ record: GridRecord }>(
+            `/api/records/${encodeURIComponent(target.recordId)}`,
+          )
+          const known = latestRevisionsRef.current.get(target.recordId) ?? 0
+          latestRevisionsRef.current.set(
+            target.recordId,
+            Math.max(known, latest.record.revision),
+          )
+          const currentValue = latest.record.values[target.fieldId]
+          const current = Array.isArray(currentValue) ? currentValue : []
+          const outcome = await batchUpdateCells([
+            {
               recordId: target.recordId,
-            }),
-          })
-          const stored = await requestJson<{
-            storageId: string
-            name: string
-            mimeType: string
-          }>(session.uploadUrl, {
-            method: "PUT",
-            body: file,
-            headers: {
-              "content-type": file.type || "application/octet-stream",
-              "x-file-name": file.name,
+              fieldId: target.fieldId,
+              value: [...current, ...uploaded] as CellValue,
+              expectedRevision: latest.record.revision,
             },
-          })
-          const finalized = await requestJson<{
-            attachment: { attachmentId: string; name: string; mimeType: string; size: number }
-          }>("/api/attachments/finalize", {
-            method: "POST",
-            body: JSON.stringify({
-              uploadSessionId: session.uploadSessionId,
-              storageId: stored.storageId,
-              name: stored.name,
-              mimeType: stored.mimeType,
-            }),
-          })
-          appended.push(finalized.attachment)
+          ])
+          if ("saved" in outcome && outcome.saved === false) {
+            setError(outcome.message ?? "Could not attach this file.")
+          }
+        } catch (uploadError) {
+          setError(
+            uploadError instanceof Error
+              ? uploadError.message
+              : "Could not upload this file.",
+          )
+        } finally {
+          endWrite()
         }
-        await batchUpdateCells([
-          {
-            recordId: target.recordId,
-            fieldId: target.fieldId,
-            value: appended as CellValue,
-            expectedRevision: record.revision,
-          },
-        ])
-      } catch (uploadError) {
-        setError(
-          uploadError instanceof Error
-            ? uploadError.message
-            : "Could not upload this file.",
-        )
-      } finally {
-        setSyncing(false)
-      }
+      })
+      uploadChainsRef.current.set(cellKey, next)
+      void next.finally(() => {
+        if (uploadChainsRef.current.get(cellKey) === next) {
+          uploadChainsRef.current.delete(cellKey)
+        }
+      })
+      return next
     },
-    [batchUpdateCells, records, tableId],
+    [batchUpdateCells, beginWrite, endWrite, tableId],
   )
 
   return {
