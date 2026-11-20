@@ -259,7 +259,10 @@ function FormControl({
     )
   }
 
-  if (field.type === "attachment") {
+  if (field.type === "attachment" || field.type === "image") {
+    const isSingleImage = field.type === "image"
+    const effectiveKind = isSingleImage ? "image" : field.config.attachmentKind
+    const maxItems = isSingleImage ? 1 : MAX_ATTACHMENTS_PER_CELL
     const files = selectedFiles ?? []
     return (
       <div className="grid gap-2">
@@ -268,9 +271,13 @@ function FormControl({
           className="flex min-h-28 cursor-pointer flex-col items-center justify-center rounded-xl border border-dashed bg-white px-4 text-center transition hover:border-primary/45 hover:bg-primary/[0.025]"
         >
           <FileUp className="size-5 text-primary" />
-          <span className="mt-2 text-sm font-medium">Choose files</span>
+          <span className="mt-2 text-sm font-medium">
+            {isSingleImage ? "Choose image" : "Choose files"}
+          </span>
           <span className="mt-1 text-xs text-muted-foreground">
-            Up to 25 MB each · 10 files maximum
+            {isSingleImage
+              ? "Up to 25 MB · 1 image maximum"
+              : "Up to 25 MB each · 10 files maximum"}
           </span>
           <input
             id={id}
@@ -284,8 +291,8 @@ function FormControl({
             }
             aria-invalid={invalid || Boolean(fileError)}
             aria-required={question.required}
-            multiple
-            accept={attachmentAccept(field.config.attachmentKind)}
+            multiple={!isSingleImage}
+            accept={attachmentAccept(effectiveKind)}
             onChange={(event) => {
               const chosen = Array.from(event.currentTarget.files ?? [])
               const accepted: File[] = []
@@ -294,7 +301,7 @@ function FormControl({
               for (const file of chosen) {
                 const kindError = attachmentKindErrorMessage(
                   file,
-                  field.config.attachmentKind,
+                  effectiveKind,
                 )
                 if (kindError) {
                   nextError ??= kindError
@@ -306,7 +313,7 @@ function FormControl({
                 }
                 if (
                   files.length + accepted.length >=
-                  MAX_ATTACHMENTS_PER_CELL
+                  maxItems
                 ) {
                   nextError ??= `You can attach up to ${MAX_ATTACHMENTS_PER_CELL} files.`
                   continue
@@ -538,7 +545,7 @@ export function PublicForm({
     const data = new FormData(formElement)
     for (const question of form.questions) {
       const field = fields.find((item) => item.id === question.fieldId)
-      if (field?.type !== "attachment") continue
+      if (field?.type !== "attachment" && field?.type !== "image") continue
       data.delete(question.id)
       for (const file of selectedFilesByQuestion[question.id] ?? []) {
         data.append(question.id, file)

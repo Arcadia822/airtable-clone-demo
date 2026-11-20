@@ -25,6 +25,7 @@ import {
   DollarSign,
   GripVertical,
   Hash,
+  Image as ImageIcon,
   Link2,
   ListChecks,
   LoaderCircle,
@@ -63,7 +64,7 @@ import {
 import { toast } from "sonner"
 
 import { CellEditor } from "@/components/grid/cell-editor"
-import { ConnectionStatus } from "@/components/connected/connection-status"
+import { ConnectionStatus } from "@/components/grid/connection-status"
 import { FieldValidationInputs } from "@/components/field-validation-inputs"
 import {
   AlertDialog,
@@ -200,6 +201,8 @@ const FIELD_TYPE_ICONS: Record<FieldType, LucideIcon> = {
   singleSelect: CircleDot,
   multiSelect: ListChecks,
   attachment: Paperclip,
+  image: ImageIcon,
+  autoNumber: Hash,
   createdTime: Clock3,
   createdBy: UserRound,
 }
@@ -291,7 +294,7 @@ const MemoizedGridCellEditor = memo(function MemoizedGridCellEditor({
         void commitCellEditRef.current(record, field, nextValue)
       }
       onUploadFiles={
-        field.type === "attachment" && canUploadAttachments
+        (field.type === "attachment" || field.type === "image") && canUploadAttachments
           ? (files) =>
               onUploadAttachmentsRef.current?.(
                 record.id,
@@ -937,6 +940,7 @@ function defaultNewFieldConfig(type: FieldType): FieldConfig {
     }
   }
   if (type === "attachment") return { attachmentKind: "any" }
+  if (type === "image") return { attachmentKind: "image" }
   if (type === "date") return { dateStyle: "date" }
   if (type === "currency") return { currency: "USD", precision: 2 }
   if (type === "rating") return { min: 1, max: 5, precision: 0 }
@@ -1940,6 +1944,7 @@ export function DataGrid({
       if (
         !record ||
         !field ||
+        field.type === "autoNumber" ||
         field.type === "createdTime" ||
         field.type === "createdBy"
       ) {

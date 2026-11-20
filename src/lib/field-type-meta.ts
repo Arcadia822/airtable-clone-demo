@@ -15,6 +15,8 @@ export const FIELD_TYPE_LABELS: Record<FieldType, string> = {
   singleSelect: "Single choice",
   multiSelect: "Multiple choice",
   attachment: "File or image",
+  image: "Image",
+  autoNumber: "Autonumber",
   createdTime: "Created time",
   createdBy: "Created by",
 }

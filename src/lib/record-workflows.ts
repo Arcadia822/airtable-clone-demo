@@ -71,6 +71,8 @@ export function duplicateRecordValues(
   for (const field of fields) {
     if (
       field.type === "attachment" ||
+      field.type === "image" ||
+      field.type === "autoNumber" ||
       field.type === "createdBy" ||
       field.type === "createdTime"
     ) {

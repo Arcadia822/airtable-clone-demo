@@ -10,6 +10,7 @@ import {
 
 import { RecordDrawer } from "@/components/views/record-drawer"
 import { Button } from "@/components/ui/button"
+import { useCompactViewport } from "@/hooks/use-mobile"
 import type {
   CellValue,
   FieldDefinition,
@@ -87,6 +88,7 @@ export function CalendarView({
   )
   const [openRecordId, setOpenRecordId] = useState<string>()
   const [dropDay, setDropDay] = useState<string>()
+  const compact = useCompactViewport()
   const days = useMemo(() => calendarMonthDays(month), [month])
   const scheduled = useMemo(
     () => recordsByCalendarDay(records, dateField),
@@ -127,8 +129,8 @@ export function CalendarView({
 
   return (
     <>
-      <div className="flex min-h-0 flex-1 flex-col bg-muted/15">
-        <header className="flex h-12 shrink-0 items-center gap-2 border-b bg-background px-3">
+      <div className="flex min-h-0 w-full min-w-0 max-w-full flex-1 flex-col overflow-hidden bg-muted/15">
+        <header className="flex min-h-12 shrink-0 flex-wrap items-center gap-1 border-b bg-background px-2 py-1.5 sm:h-12 sm:flex-nowrap sm:gap-2 sm:px-3 sm:py-0">
           <Button
             aria-label="Previous month"
             onClick={() =>
@@ -155,7 +157,7 @@ export function CalendarView({
           >
             <ChevronRight />
           </Button>
-          <h2 className="min-w-36 text-sm font-semibold">
+          <h2 className="min-w-0 flex-1 truncate text-sm font-semibold sm:min-w-36 sm:flex-none">
             {month.toLocaleDateString(undefined, {
               month: "long",
               year: "numeric",
@@ -169,30 +171,32 @@ export function CalendarView({
             {" · "}
             {timezone}
           </span>
-          <div
-            aria-label="Calendar display"
-            className="ml-auto flex rounded-lg border bg-muted/30 p-0.5"
-            role="group"
-          >
-            <Button
-              aria-pressed={display === "month"}
-              onClick={() => selectDisplay("month")}
-              size="sm"
-              variant={display === "month" ? "secondary" : "ghost"}
+          {compact ? null : (
+            <div
+              aria-label="Calendar display"
+              className="ml-auto flex rounded-lg border bg-muted/30 p-0.5"
+              role="group"
             >
-              <CalendarDays />
-              Month
-            </Button>
-            <Button
-              aria-pressed={display === "agenda"}
-              onClick={() => selectDisplay("agenda")}
-              size="sm"
-              variant={display === "agenda" ? "secondary" : "ghost"}
-            >
-              <List />
-              Agenda
-            </Button>
-          </div>
+              <Button
+                aria-pressed={display === "month"}
+                onClick={() => selectDisplay("month")}
+                size="sm"
+                variant={display === "month" ? "secondary" : "ghost"}
+              >
+                <CalendarDays />
+                Month
+              </Button>
+              <Button
+                aria-pressed={display === "agenda"}
+                onClick={() => selectDisplay("agenda")}
+                size="sm"
+                variant={display === "agenda" ? "secondary" : "ghost"}
+              >
+                <List />
+                Agenda
+              </Button>
+            </div>
+          )}
           <Button
             onClick={() =>
               setMonth(
@@ -205,8 +209,8 @@ export function CalendarView({
             Today
           </Button>
         </header>
-        {display === "month" ? (
-          <div className="min-h-0 flex-1 overflow-auto">
+        {display === "month" && !compact ? (
+          <div className="min-h-0 min-w-0 max-w-full flex-1 overflow-auto">
             <div
               aria-label={`Calendar using ${dateField.name}`}
               className="grid min-h-full min-w-[900px] grid-cols-7 grid-rows-[28px_repeat(6,minmax(110px,1fr))]"
@@ -306,7 +310,7 @@ export function CalendarView({
         ) : (
           <div
             aria-label={`Agenda using ${dateField.name}`}
-            className="min-h-0 flex-1 overflow-y-auto p-4"
+            className="min-h-0 min-w-0 max-w-full flex-1 overflow-y-auto p-2 sm:p-4"
           >
             {agendaDays.length ? (
               <div className="mx-auto grid max-w-3xl gap-3">
@@ -348,7 +352,7 @@ export function CalendarView({
                             : "All day"
                         return (
                           <div
-                            className="flex items-center gap-3 px-4 py-2 hover:bg-muted/30"
+                            className="flex flex-wrap items-center gap-2 px-3 py-2 hover:bg-muted/30 sm:flex-nowrap sm:gap-3 sm:px-4"
                             key={record.id}
                           >
                             <button
@@ -392,10 +396,10 @@ export function CalendarView({
           </div>
         )}
         {scheduled.unscheduled.length > 0 ? (
-          <aside className="shrink-0 border-t bg-background p-2">
+          <aside className="min-w-0 max-w-full shrink-0 overflow-hidden border-t bg-background p-2">
             <p className="mb-2 text-xs font-medium">
               No {dateField.name.toLocaleLowerCase()}{" "}
-              {display === "month" ? (
+              {display === "month" && !compact ? (
                 <span className="font-normal text-muted-foreground">
                   · drag onto a day
                 </span>

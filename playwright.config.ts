@@ -1,66 +1,54 @@
 import { defineConfig, devices } from "@playwright/test"
 
-const connectedE2E = process.env.BASECRAFT_CONNECTED_E2E === "1"
-
-if (connectedE2E && typeof process.loadEnvFile === "function") {
-  try {
-    process.loadEnvFile(".env.local")
-  } catch {
-    // Connected CI can supply its own environment without a local file.
-  }
-}
-if (connectedE2E) {
-  process.env.CLERK_PUBLISHABLE_KEY ??=
-    process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY
-}
-
-const connectedAuthState = "playwright/.clerk/user.json"
+/**
+ * End-to-end suite for the shipped product surface.
+ *
+ * The suite runs against `next start` (run `pnpm build` first) with a throwaway
+ * PGlite database so every run starts from the seeded workspace. A dedicated
+ * port keeps a local `next dev` on 3000 untouched.
+ */
+const PORT = Number(process.env.E2E_PORT ?? 3100)
+const DATABASE_URL = "pglite:.data/e2e"
 
 export default defineConfig({
   testDir: "./tests/e2e",
-  fullyParallel: true,
+  fullyParallel: false,
   forbidOnly: Boolean(process.env.CI),
-  retries: process.env.CI ? 2 : 0,
-  workers: process.env.CI ? 1 : 2,
-  reporter: "html",
+  // The suite is stateful (one seeded database, serial ordering); a retry would
+  // replay tests against already-mutated data, so failures stay failures.
+  retries: 0,
+  workers: 1,
+  reporter: process.env.CI ? [["list"], ["html", { open: "never" }]] : "list",
   use: {
-    // Clerk treats localhost as its supported local-HTTP development origin.
-    // Using 127.0.0.1 can make handshake cookies cross-site and unusable.
-    baseURL: "http://localhost:3000",
-    trace: "on-first-retry",
+    baseURL: `http://localhost:${PORT}`,
+    trace: "retain-on-failure",
+    screenshot: "only-on-failure",
   },
   webServer: {
-    command: connectedE2E ? "pnpm dev" : "pnpm dev:next",
-    url: "http://localhost:3000",
-    reuseExistingServer: !process.env.CI,
-    timeout: 120_000,
+    // Fresh database per run: the first request seeds the workspace.
+    command: `rm -rf ${DATABASE_URL.slice("pglite:".length)} && pnpm start --port ${PORT}`,
+    url: `http://localhost:${PORT}`,
+    reuseExistingServer: false,
+    timeout: 180_000,
+    gracefulShutdown: { signal: "SIGTERM", timeout: 10_000 },
+    env: {
+      DATABASE_URL,
+      PORT: String(PORT),
+      NEXT_TELEMETRY_DISABLED: "1",
+      // Local single-tenant mode: no Factory visitor auth, no Factory AI.
+      // `next start` runs with NODE_ENV=production, where auth fails closed
+      // unless this is set, so every request would otherwise answer 503.
+      ALLOW_LOCAL_WORKSPACE: "1",
+      FACTORY_VISITOR_AUTH_URL: "",
+      FACTORY_VISITOR_AUTH_TOKEN: "",
+      FACTORY_APP_AI_URL: "",
+      FACTORY_APP_AI_TOKEN: "",
+    },
   },
-  projects: connectedE2E
-    ? [
-        {
-          name: "setup",
-          testMatch: /connected-auth\.setup\.ts/,
-        },
-        {
-          name: "connected",
-          dependencies: ["setup"],
-          testMatch: /connected-(?:experience|ai)\.spec\.ts/,
-          use: {
-            ...devices["Desktop Chrome"],
-            storageState: connectedAuthState,
-          },
-        },
-      ]
-    : [
-        {
-          name: "chromium",
-          use: { ...devices["Desktop Chrome"] },
-          testIgnore: /connected-(?:experience|ai)\.spec\.ts/,
-        },
-        {
-          name: "mobile",
-          use: { ...devices["iPhone 14"] },
-          testIgnore: /connected-(?:experience|ai)\.spec\.ts/,
-        },
-      ],
+  projects: [
+    {
+      name: "chromium",
+      use: { ...devices["Desktop Chrome"] },
+    },
+  ],
 })

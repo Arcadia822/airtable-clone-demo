@@ -23,6 +23,8 @@ const TOOL_TITLES: Record<string, string> = {
   create_field: "Add a column",
   create_form: "Create a form",
   create_record: "Add a record",
+  create_table: "Create a table",
+  create_view: "Create a view",
   delete_field: "Delete a column",
   delete_record: "Delete a record",
   describe_table: "Review table structure",
@@ -306,6 +308,28 @@ function buildToolDetails(
         detail("Type", fieldTypeLabel(input?.expectedType)),
         detail("Impact", input?.dataLossSummary),
       ].filter(isDetail)
+    case "create_table": {
+      const fields = asArray(input?.fields)
+      const sampleRows = asArray(input?.sampleRows)
+      return [
+        detail("Before", "No new table"),
+        detail("After", input?.name),
+        detail(
+          "Columns",
+          fields
+            ? `${fields.length} ${fields.length === 1 ? "column" : "columns"}`
+            : undefined,
+        ),
+        detail("Includes", namedItems(fields, ["name"])),
+        detail("Sample rows", sampleRows?.length),
+      ].filter(isDetail)
+    }
+    case "create_view":
+      return [
+        detail("Before", "No new view"),
+        detail("After", input?.name),
+        detail("View type", viewTypeLabel(input?.type)),
+      ].filter(isDetail)
     case "create_form": {
       const fields = asArray(input?.fields)
       return [
@@ -384,11 +408,19 @@ function buildToolResult(
     return undefined
   }
 
+  if (toolName === "create_table") {
+    const fieldCount = output.fieldCount
+    return typeof fieldCount === "number" && Number.isFinite(fieldCount)
+      ? `Table created with ${fieldCount} ${fieldCount === 1 ? "column" : "columns"}.`
+      : "The new table is ready."
+  }
+
   if (
     [
       "create_field",
       "create_form",
       "create_record",
+      "create_view",
       "delete_field",
       "delete_record",
       "update_form_settings",
@@ -525,6 +557,21 @@ function readableChangeValue(value: unknown): string | undefined {
 function fieldTypeLabel(value: unknown): string | undefined {
   return typeof value === "string" && value in FIELD_TYPE_LABELS
     ? FIELD_TYPE_LABELS[value as FieldType]
+    : undefined
+}
+
+const VIEW_TYPE_LABELS: Record<string, string> = {
+  calendar: "Calendar",
+  dashboard: "Dashboard",
+  gallery: "Gallery",
+  grid: "Grid",
+  kanban: "Kanban",
+  timeline: "Timeline",
+}
+
+function viewTypeLabel(value: unknown): string | undefined {
+  return typeof value === "string" && value in VIEW_TYPE_LABELS
+    ? VIEW_TYPE_LABELS[value]
     : undefined
 }
 
