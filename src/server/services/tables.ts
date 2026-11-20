@@ -1,4 +1,4 @@
-import { and, asc, eq, inArray } from "drizzle-orm"
+import { and, asc, eq, inArray, sql } from "drizzle-orm"
 import { generateKeyBetween } from "jittered-fractional-indexing"
 import { nanoid } from "nanoid"
 import { z } from "zod"
@@ -165,6 +165,49 @@ export function nextRank(ranks: readonly string[]): string {
     if (last === null || rank > last) last = rank
   }
   return generateKeyBetween(last, null)
+}
+
+/**
+ * Reserves `count` consecutive values for each auto-number field and returns
+ * the first reserved value per field. Each reservation is a single atomic
+ * `UPDATE ... RETURNING`, so concurrent callers can never receive the same
+ * counter.
+ */
+export async function allocateSequenceValues(
+  db: AppDb,
+  tableId: string,
+  fieldIds: readonly string[],
+  count: number,
+): Promise<Record<string, number>> {
+  const firstValues: Record<string, number> = {}
+  for (const fieldId of fieldIds) {
+    const [updated] = await db
+      .update(fieldSequences)
+      .set({ nextValue: sql`${fieldSequences.nextValue} + ${count}` })
+      .where(and(eq(fieldSequences.fieldId, fieldId), eq(fieldSequences.tableId, tableId)))
+      .returning({ nextValue: fieldSequences.nextValue })
+
+    if (updated) {
+      firstValues[fieldId] = updated.nextValue - count
+      continue
+    }
+
+    await db
+      .insert(fieldSequences)
+      .values({ fieldId, tableId, nextValue: count + 1 })
+      .onConflictDoNothing()
+
+    const [retried] = await db
+      .update(fieldSequences)
+      .set({ nextValue: sql`${fieldSequences.nextValue} + ${count}` })
+      .where(and(eq(fieldSequences.fieldId, fieldId), eq(fieldSequences.tableId, tableId)))
+      .returning({ nextValue: fieldSequences.nextValue })
+    if (!retried) {
+      throw new AppError("VALIDATION_ERROR", "Auto-number sequence is unavailable.")
+    }
+    firstValues[fieldId] = retried.nextValue - count
+  }
+  return firstValues
 }
 
 export function toMillis(value: Date | string | number | null | undefined): number {

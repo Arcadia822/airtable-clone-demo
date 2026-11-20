@@ -12,6 +12,7 @@ import { AppError, type FieldConfig, type FieldDefinition, type FieldType } from
 import { buildRecordSearchText } from "@/server/search-text"
 
 import {
+  allocateSequenceValues,
   defaultFieldWidth,
   fieldInputSchema,
   fieldRowToDefinition,
@@ -158,12 +159,9 @@ export async function createField(
 
     if (type === "autoNumber") {
       await tx.insert(fieldSequences).values({ fieldId, tableId, nextValue: 1 })
+      await backfillAutoNumber(tx, orgId, tableId, fieldId)
     }
   })
-
-  if (type === "autoNumber") {
-    await backfillAutoNumber(db, orgId, tableId, fieldId)
-  }
 
   const [row] = await db
     .select()
@@ -174,6 +172,14 @@ export async function createField(
   return { field: fieldRowToDefinition(row) }
 }
 
+/**
+ * Backfills an existing auto-number column in rank order. Runs inside the
+ * caller's transaction and reserves the whole backfill range with one atomic
+ * sequence update, so no counter is ever handed out twice.
+ *
+ * Only `updatedAt` moves: a backfill is not a user edit, so in-flight
+ * optimistic writes keep their revision and never see a false conflict.
+ */
 async function backfillAutoNumber(
   db: AppDb,
   orgId: string,
@@ -192,30 +198,22 @@ async function backfillAutoNumber(
         eq(recordsTable.status, "active"),
       ),
     )
-    .orderBy(asc(recordsTable.rank))
+    .orderBy(asc(recordsTable.rank), asc(recordsTable.createdAt))
 
-  await db.transaction(async (rawTx) => {
-    const tx = rawTx as unknown as AppDb
-    let counter = 1
-    for (const record of recordRows) {
-      const values = { ...(record.values ?? {}), [fieldId]: counter }
-      counter += 1
-      const searchText = buildRecordSearchText(values, definitions)
-      await tx
-        .update(recordsTable)
-        .set({
-          values,
-          searchText,
-          revision: record.revision + 1,
-          updatedAt: new Date(),
-        })
-        .where(eq(recordsTable.id, record.id))
-    }
-    await tx
-      .update(fieldSequences)
-      .set({ nextValue: recordRows.length + 1 })
-      .where(and(eq(fieldSequences.fieldId, fieldId), eq(fieldSequences.tableId, tableId)))
-  })
+  const assigned = await allocateSequenceValues(db, tableId, [fieldId], recordRows.length)
+  let counter = assigned[fieldId] ?? 1
+  for (const record of recordRows) {
+    const values = { ...(record.values ?? {}), [fieldId]: counter }
+    counter += 1
+    await db
+      .update(recordsTable)
+      .set({
+        values,
+        searchText: buildRecordSearchText(values, definitions),
+        updatedAt: new Date(),
+      })
+      .where(and(eq(recordsTable.id, record.id), eq(recordsTable.orgId, orgId)))
+  }
 }
 
 export async function updateField(

@@ -1,13 +1,9 @@
-import { and, asc, desc, eq, inArray, sql } from "drizzle-orm"
+import { and, asc, desc, eq, inArray, or, sql, type SQL } from "drizzle-orm"
 import { generateKeyBetween } from "jittered-fractional-indexing"
 import { nanoid } from "nanoid"
 import { z } from "zod"
 
-import {
-  attachments as attachmentsTable,
-  fieldSequences,
-  records as recordsTable,
-} from "../../../drizzle/schema"
+import { attachments as attachmentsTable, records as recordsTable } from "../../../drizzle/schema"
 import type { AppDb } from "@/db/client"
 import { isReadOnlyFieldType, validateCellValue, validateRecordValues } from "@/lib/cell-validation"
 import { AppError, type CellValue, type FieldDefinition, type GridRecord } from "@/lib/domain"
@@ -16,6 +12,7 @@ import {
   flattenSavedViewGroups,
   processSavedView,
   type SavedViewDefinition,
+  type SavedViewFilter,
   type SavedViewGroup,
   type SavedViewRecordGroup,
   type SavedViewSort,
@@ -23,6 +20,7 @@ import {
 
 import { attachmentValueFromRow, type ResolvedAttachment } from "@/server/services/attachments"
 import {
+  allocateSequenceValues,
   fieldRowToDefinition,
   listActiveFields,
   recordRowToGridRecord,
@@ -32,7 +30,7 @@ import {
 
 export type RecordRow = typeof recordsTable.$inferSelect
 
-const filterSchema = z.object({
+export const savedViewFilterSchema = z.object({
   id: z.string().min(1),
   fieldId: z.string().min(1),
   operator: z.enum([
@@ -52,14 +50,14 @@ const filterSchema = z.object({
     .optional(),
 })
 
-const sortSchema = z.object({
+export const savedViewSortSchema = z.object({
   id: z.string().min(1),
   fieldId: z.string().min(1),
   direction: z.enum(["asc", "desc"]),
   rank: z.string().min(1),
 })
 
-const groupSchema = z.object({
+export const savedViewGroupSchema = z.object({
   id: z.string().min(1),
   fieldId: z.string().min(1),
   direction: z.enum(["asc", "desc"]),
@@ -68,9 +66,9 @@ const groupSchema = z.object({
 
 export const queryRecordsInputSchema = z.object({
   filterConjunction: z.enum(["and", "or"]).optional(),
-  filters: z.array(filterSchema).optional(),
-  sorts: z.array(sortSchema).optional(),
-  groups: z.array(groupSchema).optional(),
+  filters: z.array(savedViewFilterSchema).optional(),
+  sorts: z.array(savedViewSortSchema).optional(),
+  groups: z.array(savedViewGroupSchema).optional(),
   search: z.string().max(400).optional(),
   limit: z.number().int().min(1).max(1_000).optional(),
   offset: z.number().int().min(0).max(100_000).optional(),
@@ -284,47 +282,6 @@ function assertCellLimits(
   }
 }
 
-async function allocateSequenceValues(
-  tx: AppDb,
-  tableId: string,
-  fieldIds: readonly string[],
-  count: number,
-): Promise<Record<string, number>> {
-  const firstValues: Record<string, number> = {}
-  for (const fieldId of fieldIds) {
-    const [updated] = await tx
-      .update(fieldSequences)
-      .set({ nextValue: sql`${fieldSequences.nextValue} + ${count}` })
-      .where(
-        and(eq(fieldSequences.fieldId, fieldId), eq(fieldSequences.tableId, tableId)),
-      )
-      .returning({ nextValue: fieldSequences.nextValue })
-
-    if (updated) {
-      firstValues[fieldId] = updated.nextValue - count
-      continue
-    }
-
-    await tx
-      .insert(fieldSequences)
-      .values({ fieldId, tableId, nextValue: count + 1 })
-      .onConflictDoNothing()
-
-    const [retried] = await tx
-      .update(fieldSequences)
-      .set({ nextValue: sql`${fieldSequences.nextValue} + ${count}` })
-      .where(
-        and(eq(fieldSequences.fieldId, fieldId), eq(fieldSequences.tableId, tableId)),
-      )
-      .returning({ nextValue: fieldSequences.nextValue })
-    if (!retried) {
-      throw new AppError("VALIDATION_ERROR", "Auto-number sequence is unavailable.")
-    }
-    firstValues[fieldId] = retried.nextValue - count
-  }
-  return firstValues
-}
-
 export async function createRecord(
   db: AppDb,
   orgId: string,
@@ -350,6 +307,10 @@ export async function createRecord(
 
   await db.transaction(async (rawTx) => {
     const tx = rawTx as unknown as AppDb
+    // Two creates that read the same "last rank" would mint the same key.
+    // A transaction-scoped advisory lock serializes rank assignment per table
+    // and releases automatically on commit/rollback.
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${tableId}))`)
     const assigned = await allocateSequenceValues(tx, tableId, autoNumberFieldIds, 1)
     for (const [fieldId, value] of Object.entries(assigned)) {
       values[fieldId] = value
@@ -429,18 +390,43 @@ export async function updateRecord(
   )
   assertCellLimits(validated, definitions)
   const values: Record<string, unknown> = { ...(row.values ?? {}), ...validated }
-  const revision = row.revision + 1
 
-  await db
+  // Single-statement compare-and-swap: the revision guard lives in the WHERE
+  // clause, so a concurrent writer can never be silently overwritten between
+  // the read above and this write.
+  const [written] = await db
     .update(recordsTable)
     .set({
       values,
-      revision,
+      revision: sql`${recordsTable.revision} + 1`,
       searchText: buildRecordSearchText(values, definitions),
       updatedBy: userId,
       updatedAt: new Date(),
     })
-    .where(and(eq(recordsTable.id, row.id), eq(recordsTable.orgId, orgId)))
+    .where(
+      and(
+        eq(recordsTable.id, row.id),
+        eq(recordsTable.orgId, orgId),
+        eq(recordsTable.status, "active"),
+        input.expectedRevision !== undefined
+          ? eq(recordsTable.revision, input.expectedRevision)
+          : undefined,
+      ),
+    )
+    .returning({ revision: recordsTable.revision })
+
+  if (!written) {
+    const [current] = await db
+      .select({ revision: recordsTable.revision })
+      .from(recordsTable)
+      .where(and(eq(recordsTable.id, row.id), eq(recordsTable.orgId, orgId)))
+      .limit(1)
+    throw new AppError("REVISION_CONFLICT", "This record was updated by someone else.", {
+      recordId: row.id,
+      expectedRevision: input.expectedRevision ?? row.revision,
+      actualRevision: current?.revision ?? row.revision,
+    })
+  }
 
   return getRecord(db, orgId, recordId)
 }
@@ -478,6 +464,7 @@ export async function batchUpdateRecords(
   if (rowsById.size !== recordIds.length) {
     throw new AppError("NOT_FOUND", "One or more records do not belong to this table.")
   }
+  const expectedByRecordId = new Map<string, number>()
   const updatesByRecordId = new Map<
     string,
     Array<{ fieldId: string; value: CellValue }>
@@ -495,6 +482,9 @@ export async function batchUpdateRecords(
     }
     const row = rowsById.get(update.recordId)!
     assertRevision(row, update.expectedRevision)
+    if (update.expectedRevision !== undefined) {
+      expectedByRecordId.set(update.recordId, update.expectedRevision)
+    }
     const validated = validateCellWithinLimits(field, update.value)
     const existing = updatesByRecordId.get(update.recordId) ?? []
     existing.push({ fieldId: update.fieldId, value: validated })
@@ -510,18 +500,41 @@ export async function batchUpdateRecords(
       for (const cell of cellUpdates) {
         values[cell.fieldId] = cell.value
       }
-      const revision = row.revision + 1
-      revisions[recordId] = revision
-      await tx
+      // Conditional write: the revision we read (or the caller's expected
+      // revision) is part of the WHERE clause, so only a revision that actually
+      // landed is ever reported back.
+      const expectedRevision = expectedByRecordId.get(recordId) ?? row.revision
+      const [written] = await tx
         .update(recordsTable)
         .set({
           values,
-          revision,
+          revision: sql`${recordsTable.revision} + 1`,
           searchText: buildRecordSearchText(values, definitions),
           updatedBy: userId,
           updatedAt: new Date(),
         })
-        .where(and(eq(recordsTable.id, recordId), eq(recordsTable.orgId, orgId)))
+        .where(
+          and(
+            eq(recordsTable.id, recordId),
+            eq(recordsTable.orgId, orgId),
+            eq(recordsTable.status, "active"),
+            eq(recordsTable.revision, expectedRevision),
+          ),
+        )
+        .returning({ revision: recordsTable.revision })
+      if (!written) {
+        const [current] = await tx
+          .select({ revision: recordsTable.revision })
+          .from(recordsTable)
+          .where(and(eq(recordsTable.id, recordId), eq(recordsTable.orgId, orgId)))
+          .limit(1)
+        throw new AppError("REVISION_CONFLICT", "This record was updated by someone else.", {
+          recordId,
+          expectedRevision,
+          actualRevision: current?.revision ?? row.revision,
+        })
+      }
+      revisions[recordId] = written.revision
     }
   })
 
@@ -617,6 +630,108 @@ function normalizeGroups(groups: readonly SavedViewGroup[] | undefined): SavedVi
   }))
 }
 
+const TEXT_FILTER_TYPES: Readonly<Partial<Record<FieldDefinition["type"], true>>> = {
+  singleLineText: true,
+  longText: true,
+  email: true,
+  phone: true,
+  url: true,
+}
+
+const NUMERIC_FILTER_TYPES: Readonly<Partial<Record<FieldDefinition["type"], true>>> = {
+  number: true,
+  currency: true,
+  percent: true,
+  rating: true,
+  autoNumber: true,
+}
+
+function escapeLikePattern(value: string): string {
+  return value.replace(/[\\%_]/g, (character) => `\\${character}`)
+}
+
+function containsPattern(value: string): string {
+  return `%${escapeLikePattern(value)}%`
+}
+
+/**
+ * SQL predicate that is a *superset* of `matchesFilter` for every field type it
+ * translates. Records the pure view engine keeps are therefore never dropped by
+ * the pre-filter, so the in-memory pass stays authoritative while the scanned
+ * row set stays bounded.
+ */
+function filterNarrowing(
+  field: FieldDefinition,
+  filter: SavedViewFilter,
+): SQL | undefined {
+  const text = sql`${recordsTable.values} ->> ${field.id}`
+
+  if (TEXT_FILTER_TYPES[field.type]) {
+    switch (filter.operator) {
+      case "is_empty":
+        // Blankness cannot be narrowed safely: the engine trims Unicode
+        // whitespace, which SQL `btrim` does not. Scan without a predicate.
+        return undefined
+      case "is_not_empty":
+        return sql`coalesce(btrim(${text}), '') <> ''`
+      case "contains": {
+        const token = typeof filter.value === "string" ? filter.value.trim() : ""
+        if (!token) return undefined
+        return sql`${text} ilike ${containsPattern(token)} escape '\\'`
+      }
+      case "is": {
+        // Engine equality is trimmed, case-insensitive equality, so a matching
+        // row necessarily contains the trimmed expectation as a substring.
+        const expected = typeof filter.value === "string" ? filter.value.trim() : ""
+        if (!expected) return undefined
+        return sql`${text} ilike ${containsPattern(expected)} escape '\\'`
+      }
+      default:
+        return undefined
+    }
+  }
+
+  if (NUMERIC_FILTER_TYPES[field.type]) {
+    const expected = typeof filter.value === "number" ? filter.value : Number(filter.value)
+    if (!Number.isFinite(expected)) return undefined
+    const numeric = sql`(${recordsTable.values} ->> ${field.id})::numeric`
+    const isNumber = sql`jsonb_typeof(${recordsTable.values} -> ${field.id}) = 'number'`
+    switch (filter.operator) {
+      case "is":
+        return sql`${isNumber} and ${numeric} = ${expected}`
+      case "greater_than":
+      case "after":
+        return sql`${isNumber} and ${numeric} > ${expected}`
+      case "less_than":
+      case "before":
+        return sql`${isNumber} and ${numeric} < ${expected}`
+      default:
+        return undefined
+    }
+  }
+
+  return undefined
+}
+
+/**
+ * Exact SQL rendering of the free-text search: one `ILIKE` per term over the
+ * denormalized `search_text` column, matching the substring semantics of the
+ * previous in-memory scan.
+ */
+function searchNarrowing(search: string | undefined): SQL | undefined {
+  const terms = (search ?? "")
+    .toLowerCase()
+    .split(/\s+/)
+    .filter(Boolean)
+  if (!terms.length) return undefined
+  return and(
+    ...terms.map(
+      (term) =>
+        sql`${recordsTable.searchText} ilike ${containsPattern(term)} escape '\\'`,
+    ),
+  )
+}
+
 export interface QueryRecordsResult {
   records: GridRecord[]
   totalCount: number
@@ -640,36 +755,79 @@ export async function queryRecords(
   const fieldRows = await listActiveFields(db, orgId, tableId)
   const definitions = fieldRows.map(fieldRowToDefinition)
 
-  const rows = await db
-    .select()
-    .from(recordsTable)
-    .where(
-      and(
-        eq(recordsTable.orgId, orgId),
-        eq(recordsTable.tableId, tableId),
-        eq(recordsTable.status, "active"),
-      ),
-    )
-    .orderBy(asc(recordsTable.rank), asc(recordsTable.createdAt))
+  const fieldsById = new Map(definitions.map((field) => [field.id, field]))
+  const filters = input.filters ?? []
 
-  const terms = (input.search ?? "")
-    .toLowerCase()
-    .split(/\s+/)
-    .filter(Boolean)
-  const filteredRows = terms.length
-    ? rows.filter((row) => {
-        const haystack = (row.searchText ?? "").toLowerCase()
-        return terms.every((term) => haystack.includes(term))
-      })
-    : rows
+  // Narrow in SQL first. Every translated predicate is a superset of the pure
+  // view engine's match, so the in-memory pass below remains authoritative.
+  const narrowing: SQL[] = []
+  let translatesEveryFilter = true
+  for (const filter of filters) {
+    const field = fieldsById.get(filter.fieldId)
+    if (!field) continue
+    const condition = filterNarrowing(field, filter)
+    if (condition) {
+      narrowing.push(condition)
+    } else {
+      translatesEveryFilter = false
+    }
+  }
+  const conjunction = input.filterConjunction ?? "and"
+  let filterCondition: SQL | undefined
+  if (narrowing.length > 0) {
+    if (conjunction === "and") {
+      filterCondition = and(...narrowing)
+    } else if (translatesEveryFilter) {
+      filterCondition = or(...narrowing)
+    }
+  }
 
-  const records = await hydrateRows(db, orgId, filteredRows)
+  const where = and(
+    eq(recordsTable.orgId, orgId),
+    eq(recordsTable.tableId, tableId),
+    eq(recordsTable.status, "active"),
+    searchNarrowing(input.search),
+    filterCondition,
+  )
+  const offset = input.offset ?? 0
   const definition: SavedViewDefinition = {
-    filterConjunction: input.filterConjunction ?? "and",
-    filters: (input.filters ?? []) as SavedViewDefinition["filters"],
+    filterConjunction: conjunction,
+    filters: filters as SavedViewDefinition["filters"],
     sorts: normalizeSorts(input.sorts),
     groups: normalizeGroups(input.groups),
   }
+  const needsInMemoryProcessing =
+    filters.length > 0 || definition.sorts.length > 0 || definition.groups.length > 0
+
+  if (!needsInMemoryProcessing) {
+    const [counted] = await db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(recordsTable)
+      .where(where)
+    const orderedRows = db
+      .select()
+      .from(recordsTable)
+      .where(where)
+      .orderBy(asc(recordsTable.rank), asc(recordsTable.createdAt))
+    const page =
+      input.limit === undefined
+        ? await orderedRows.offset(offset)
+        : await orderedRows.limit(input.limit).offset(offset)
+    return {
+      records: await hydrateRows(db, orgId, page),
+      totalCount: counted?.count ?? 0,
+      groupLabelsByRecordId: {},
+      groups: [],
+    }
+  }
+
+  const rows = await db
+    .select()
+    .from(recordsTable)
+    .where(where)
+    .orderBy(asc(recordsTable.rank), asc(recordsTable.createdAt))
+
+  const records = await hydrateRows(db, orgId, rows)
   const processed = processSavedView(records, definitions, definition)
 
   let ordered = processed.records
@@ -681,7 +839,6 @@ export async function queryRecords(
   }
 
   const totalCount = ordered.length
-  const offset = input.offset ?? 0
   const limited =
     input.limit === undefined ? ordered.slice(offset) : ordered.slice(offset, offset + input.limit)
 

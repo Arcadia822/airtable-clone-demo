@@ -9,6 +9,11 @@ import {
 } from "../../../drizzle/schema"
 import type { AppDb } from "@/db/client"
 import { AppError, type FieldDefinition, type ViewType } from "@/lib/domain"
+import {
+  savedViewFilterSchema,
+  savedViewGroupSchema,
+  savedViewSortSchema,
+} from "@/server/services/records"
 
 import {
   listActiveFields,
@@ -32,6 +37,21 @@ const VIEW_TYPE_LABELS: Record<ViewType, string> = {
 }
 
 const DATE_FIELD_TYPES = new Set(["date", "createdTime"])
+
+const NUMERIC_FIELD_TYPES: Readonly<Partial<Record<FieldDefinition["type"], true>>> = {
+  number: true,
+  currency: true,
+  percent: true,
+  rating: true,
+  autoNumber: true,
+}
+
+const NUMERIC_AGGREGATES: Readonly<Record<string, true>> = {
+  sum: true,
+  avg: true,
+  min: true,
+  max: true,
+}
 
 function requireField(
   fieldsById: ReadonlyMap<string, FieldDefinition>,
@@ -80,12 +100,34 @@ function normalizeDashboardWidgets(
       throw new AppError("VALIDATION_ERROR", `Duplicate dashboard widget "${widget.id}".`)
     }
     seen.add(widget.id)
-    if (widget.fieldId) requireField(fieldsById, widget.fieldId, "Widget field")
+    const metricField = widget.fieldId
+      ? requireField(fieldsById, widget.fieldId, "Widget field")
+      : undefined
     if (widget.groupByFieldId) {
       requireField(fieldsById, widget.groupByFieldId, "Widget grouping field")
     }
     if (widget.kind === "chart" && !widget.groupByFieldId) {
       throw new AppError("VALIDATION_ERROR", "Chart widgets need a grouping field.")
+    }
+    if (widget.aggregate === "populated" && !metricField) {
+      throw new AppError(
+        "VALIDATION_ERROR",
+        `Widget "${widget.title}" needs a field to count populated values.`,
+      )
+    }
+    if (widget.aggregate && NUMERIC_AGGREGATES[widget.aggregate]) {
+      if (!metricField) {
+        throw new AppError(
+          "VALIDATION_ERROR",
+          `Widget "${widget.title}" needs a numeric field for the ${widget.aggregate} aggregate.`,
+        )
+      }
+      if (!NUMERIC_FIELD_TYPES[metricField.type]) {
+        throw new AppError(
+          "VALIDATION_ERROR",
+          `Widget "${widget.title}" cannot ${widget.aggregate} ${metricField.name}: that column is not numeric.`,
+        )
+      }
     }
     return {
       ...widget,
@@ -214,9 +256,9 @@ export const createViewInputSchema = z.object({
   ownerUserId: z.string().max(120).optional(),
   isDefault: z.boolean().optional(),
   filterConjunction: z.enum(["and", "or"]).optional(),
-  filters: z.array(z.unknown()).optional(),
-  sorts: z.array(z.unknown()).optional(),
-  groups: z.array(z.unknown()).optional(),
+  filters: z.array(savedViewFilterSchema).optional(),
+  sorts: z.array(savedViewSortSchema).optional(),
+  groups: z.array(savedViewGroupSchema).optional(),
   configuration: z.record(z.string(), z.unknown()).optional(),
 })
 
@@ -236,6 +278,53 @@ export async function listViews(
     .orderBy(asc(viewsTable.rank))
     .limit(500)
   return { views: rows.map(viewRowToJson) }
+}
+
+/**
+ * Guarantees one active default view per table. Several defaults collapse to
+ * the lowest ranked; none promotes the lowest ranked active view. `avoidViewId`
+ * is skipped when promoting so clearing a view's default flag hands the flag to
+ * a different view instead of immediately restoring it.
+ */
+async function ensureSingleDefaultView(
+  tx: AppDb,
+  orgId: string,
+  tableId: string,
+  avoidViewId?: string,
+): Promise<void> {
+  const rows = await tx
+    .select({ id: viewsTable.id, isDefault: viewsTable.isDefault })
+    .from(viewsTable)
+    .where(
+      and(
+        eq(viewsTable.orgId, orgId),
+        eq(viewsTable.tableId, tableId),
+        eq(viewsTable.status, "active"),
+      ),
+    )
+    .orderBy(asc(viewsTable.rank))
+  if (!rows.length) return
+  const defaults = rows.filter((row) => row.isDefault)
+  if (defaults.length === 1) return
+  const keeper =
+    defaults.find((row) => row.id !== avoidViewId) ??
+    rows.find((row) => row.id !== avoidViewId) ??
+    rows[0]
+  await tx
+    .update(viewsTable)
+    .set({ isDefault: false, updatedAt: new Date() })
+    .where(
+      and(
+        eq(viewsTable.orgId, orgId),
+        eq(viewsTable.tableId, tableId),
+        eq(viewsTable.isDefault, true),
+        ne(viewsTable.id, keeper.id),
+      ),
+    )
+  await tx
+    .update(viewsTable)
+    .set({ isDefault: true, updatedAt: new Date() })
+    .where(and(eq(viewsTable.id, keeper.id), eq(viewsTable.orgId, orgId)))
 }
 
 export async function createView(
@@ -293,6 +382,7 @@ export async function createView(
       configuration,
       status: "active",
     })
+    await ensureSingleDefaultView(tx, orgId, input.tableId)
   })
 
   const [row] = await db
@@ -351,9 +441,9 @@ export const updateViewInputSchema = z.object({
   isDefault: z.boolean().optional(),
   rank: z.string().trim().min(1).max(64).optional(),
   filterConjunction: z.enum(["and", "or"]).optional(),
-  filters: z.array(z.unknown()).optional(),
-  sorts: z.array(z.unknown()).optional(),
-  groups: z.array(z.unknown()).optional(),
+  filters: z.array(savedViewFilterSchema).optional(),
+  sorts: z.array(savedViewSortSchema).optional(),
+  groups: z.array(savedViewGroupSchema).optional(),
   configuration: z.record(z.string(), z.unknown()).optional(),
 })
 
@@ -419,6 +509,12 @@ export async function updateView(
         updatedAt: new Date(),
       })
       .where(and(eq(viewsTable.id, view.id), eq(viewsTable.orgId, orgId)))
+    await ensureSingleDefaultView(
+      tx,
+      orgId,
+      view.tableId,
+      input.isDefault === false ? view.id : undefined,
+    )
   })
 
   const [updated] = await db
@@ -438,26 +534,7 @@ export async function deleteView(db: AppDb, orgId: string, viewId: string) {
       .set({ status: "archived", updatedAt: new Date() })
       .where(and(eq(viewsTable.id, view.id), eq(viewsTable.orgId, orgId)))
 
-    if (view.isDefault) {
-      const [next] = await tx
-        .select({ id: viewsTable.id })
-        .from(viewsTable)
-        .where(
-          and(
-            eq(viewsTable.orgId, orgId),
-            eq(viewsTable.tableId, view.tableId),
-            eq(viewsTable.status, "active"),
-          ),
-        )
-        .orderBy(asc(viewsTable.rank))
-        .limit(1)
-      if (next) {
-        await tx
-          .update(viewsTable)
-          .set({ isDefault: true, updatedAt: new Date() })
-          .where(eq(viewsTable.id, next.id))
-      }
-    }
+    await ensureSingleDefaultView(tx, orgId, view.tableId, view.id)
   })
   return { ok: true as const, viewId }
 }

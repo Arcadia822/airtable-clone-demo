@@ -240,7 +240,9 @@ export function validateRecordValues(
     validated[fieldId] = validateCellValue(field, rawValue, options)
   }
 
-  const serializedSize = JSON.stringify(validated).length
+  // `.length` counts UTF-16 code units, which undercounts non-ASCII payloads by
+  // up to 3x. The limit is a byte limit, so measure the encoded payload.
+  const serializedSize = new TextEncoder().encode(JSON.stringify(validated)).length
   if (serializedSize > MAX_RECORD_VALUE_BYTES) {
     throw new AppError(
       "VALIDATION_ERROR",

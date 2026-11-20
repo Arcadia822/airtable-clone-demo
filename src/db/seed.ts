@@ -1,4 +1,5 @@
 import { and, eq } from "drizzle-orm"
+import { generateKeyBetween } from "jittered-fractional-indexing"
 import { nanoid } from "nanoid"
 
 import {
@@ -274,12 +275,19 @@ export async function ensureSeededBase(
     nextValue: sampleRecords.length + 1,
   })
 
+  // Fractional keys sort lexicographically at any length; `a10` would sort
+  // before `a2`, so append with generateKeyBetween instead of raw indices.
+  const ranks: string[] = []
+  for (let index = 0; index < sampleRecords.length; index += 1) {
+    ranks.push(generateKeyBetween(ranks[index - 1] ?? null, null))
+  }
+
   await db.insert(records).values(
     sampleRecords.map((values, index) => ({
       id: `rec_${nanoid(10)}`,
       orgId,
       tableId,
-      rank: `a${index}`,
+      rank: ranks[index],
       values,
       searchText: buildRecordSearchText(values, fieldRows),
       revision: 1,
